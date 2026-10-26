@@ -49,6 +49,29 @@ jobs:
           print("Graph configuration complete or disabled:", sum(bool(settings.get(key)) for key in ("GRAPH_TENANT_ID", "GRAPH_CLIENT_ID", "GRAPH_CLIENT_SECRET", "MAIL_FROM_ADDRESS")) in (0, 4))
           for key in ("GRAPH_TENANT_ID", "GRAPH_CLIENT_ID", "GRAPH_CLIENT_SECRET", "MAIL_FROM_ADDRESS"):
               print(key + " configured:", bool(settings.get(key, "").strip()))
+          import base64
+          import urllib.parse
+          import urllib.request
+          graph_tenant = settings.get("GRAPH_TENANT_ID") or settings.get("ENTRA_TENANT_ID", "")
+          graph_client = settings.get("GRAPH_CLIENT_ID") or settings.get("ENTRA_CLIENT_ID", "")
+          graph_secret = settings.get("GRAPH_CLIENT_SECRET", "")
+          if graph_tenant and graph_client and graph_secret:
+              try:
+                  body = urllib.parse.urlencode({"client_id": graph_client, "client_secret": graph_secret, "grant_type": "client_credentials", "scope": "https://graph.microsoft.com/.default"}).encode()
+                  with urllib.request.urlopen(urllib.request.Request(f"https://login.microsoftonline.com/{urllib.parse.quote(graph_tenant)}/oauth2/v2.0/token", data=body), timeout=30) as response:
+                      token = json.loads(response.read())["access_token"]
+                  payload = token.split(".")[1]
+                  claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+                  print("Graph token acquired with effective tenant/client:", True)
+                  print("Graph Mail.Send application permission granted:", "Mail.Send" in claims.get("roles", []))
+              except Exception as error:
+                  code = getattr(error, "code", None)
+                  detail = ""
+                  try:
+                      detail = ", ".join(sorted(set(re.findall(r"AADSTS\d+", error.read().decode("utf-8", "replace")))))
+                  except Exception:
+                      pass
+                  print("Graph token acquired with effective tenant/client:", False, f"(HTTP {code}) {detail}" if code else "")
           categories = [
               "ERR_MODULE_NOT_FOUND", "MODULE_NOT_FOUND", "ZodError", "ELOGIN", "ETIMEOUT", "ECONNREFUSED",
               "ENOTFOUND", "Login failed for user", "Cannot find module", "Missing script",
