@@ -46,7 +46,7 @@ jobs:
           for key in ("ENTRA_TENANT_ID", "ENTRA_CLIENT_ID"):
               print(key + " UUID format valid:", bool(re.fullmatch(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", settings.get(key, ""))))
           print("NODE_ENV production:", settings.get("NODE_ENV") == "production")
-          print("Graph configuration complete or disabled:", sum(bool(settings.get(key)) for key in ("GRAPH_TENANT_ID", "GRAPH_CLIENT_ID", "GRAPH_CLIENT_SECRET", "MAIL_FROM_ADDRESS")) in (0, 4))
+          print("Graph email settings complete or disabled:", sum(bool(settings.get(key)) for key in ("GRAPH_CLIENT_SECRET", "MAIL_FROM_ADDRESS")) in (0, 2))
           for key in ("GRAPH_TENANT_ID", "GRAPH_CLIENT_ID", "GRAPH_CLIENT_SECRET", "MAIL_FROM_ADDRESS"):
               print(key + " configured:", bool(settings.get(key, "").strip()))
           import base64
@@ -76,7 +76,7 @@ jobs:
               "ERR_MODULE_NOT_FOUND", "MODULE_NOT_FOUND", "ZodError", "ELOGIN", "ETIMEOUT", "ECONNREFUSED",
               "ENOTFOUND", "Login failed for user", "Cannot find module", "Missing script",
               "Admissions could not start", "Invalid environment", "Could not acquire Admissions migration lock",
-              "SQL authentication requires", "Configure all four Graph email settings",
+              "SQL authentication requires", "Configure both GRAPH_CLIENT_SECRET and MAIL_FROM_ADDRESS",
               "Failed to connect", "CREATE TABLE permission denied", "CREATE DATABASE permission denied",
           ]
           with tempfile.TemporaryDirectory() as directory:

@@ -107,7 +107,8 @@ There is no fake-data mode or silent email-to-console fallback.
 | `SQL_USER`, `SQL_PASSWORD` | Required for discrete SQL authentication |
 | `SQL_ENCRYPT` | `true` by default |
 | `SQL_TRUST_SERVER_CERTIFICATE` | `false` by default; use only for local development if needed |
-| `GRAPH_TENANT_ID`, `GRAPH_CLIENT_ID`, `GRAPH_CLIENT_SECRET`, `MAIL_FROM_ADDRESS` | Configure all four to enable email; leave all unset to disable opt-in |
+| `GRAPH_CLIENT_SECRET`, `MAIL_FROM_ADDRESS` | Configure both to enable email; leave both unset to disable opt-in. The app needs Graph application `Mail.Send` with admin consent |
+| `GRAPH_TENANT_ID`, `GRAPH_CLIENT_ID` | Optional overrides for the mail app registration; default to `ENTRA_TENANT_ID` / `ENTRA_CLIENT_ID` (same as the Applications Portal) |
 | `TRUST_PROXY_HOPS` | `0` locally; set the exact trusted hop count for hosting (usually `1` on App Service) |
 | `PORT` | `8081` by default; set as required by your host |
 | `NODE_ENV` | `production` in deployed environments |

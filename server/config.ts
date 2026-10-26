@@ -28,8 +28,8 @@ const env = z.object({
   SQL_MANAGED_IDENTITY_CLIENT_ID: optional,
   SQL_ENCRYPT: bool(true),
   SQL_TRUST_SERVER_CERTIFICATE: bool(false),
-  GRAPH_TENANT_ID: optional,
-  GRAPH_CLIENT_ID: optional,
+  GRAPH_TENANT_ID: optional.pipe(z.uuid().optional()),
+  GRAPH_CLIENT_ID: optional.pipe(z.uuid().optional()),
   GRAPH_CLIENT_SECRET: optional,
   MAIL_FROM_ADDRESS: optional.pipe(z.email().optional()),
   TRUST_PROXY_HOPS: z.coerce.number().int().min(0).max(5).default(0),
@@ -41,10 +41,17 @@ if (!(env.SQL_CONNECTION_STRING || env.SQLAZURECONNSTR_DefaultConnection || (env
 }
 if (env.SQL_AUTH === 'sql' && !env.SQL_CONNECTION_STRING && !env.SQLAZURECONNSTR_DefaultConnection
   && (!env.SQL_USER || !env.SQL_PASSWORD)) throw new Error('SQL authentication requires SQL_USER and SQL_PASSWORD.');
-const mailFields = [env.GRAPH_TENANT_ID, env.GRAPH_CLIENT_ID, env.GRAPH_CLIENT_SECRET, env.MAIL_FROM_ADDRESS];
-if (mailFields.some(Boolean) && !mailFields.every(Boolean)) throw new Error('Configure all four Graph email settings, or leave all unset.');
+// Like the Applications Portal, Graph mail uses the Entra app registration unless overridden.
+const graphTenantId = env.GRAPH_TENANT_ID ?? env.ENTRA_TENANT_ID;
+const graphClientId = env.GRAPH_CLIENT_ID ?? env.ENTRA_CLIENT_ID;
+const mailFields = [env.GRAPH_CLIENT_SECRET, env.MAIL_FROM_ADDRESS];
+if (mailFields.some(Boolean) && !mailFields.every(Boolean)) {
+  throw new Error('Configure both GRAPH_CLIENT_SECRET and MAIL_FROM_ADDRESS to enable email, or leave both unset.');
+}
 export const config = {
   ...env,
+  GRAPH_TENANT_ID: graphTenantId,
+  GRAPH_CLIENT_ID: graphClientId,
   PUBLIC_BASE_URL: new URL(env.PUBLIC_BASE_URL).origin,
   APPLICATIONS_PORTAL_URL: new URL(env.APPLICATIONS_PORTAL_URL).origin,
   emailEnabled: mailFields.every(Boolean),
