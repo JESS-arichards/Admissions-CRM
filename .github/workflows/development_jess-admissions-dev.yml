@@ -8,6 +8,11 @@ on:
     branches:
       - 'development'
   workflow_dispatch:
+    inputs:
+      configure_runtime:
+        description: Configure the approved development Portal URL and generate SESSION_SECRET only if missing
+        type: boolean
+        default: false
 
 concurrency:
   group: admissions-development
@@ -68,6 +73,42 @@ jobs:
           client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_5529A7BE1E4A4E16B4016DE1EFD941C0 }}
           tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_37920CDA620E49D5A242A07097CDF52F }}
           subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_287F7E66FDFB4243BD22FD3A88C4C8CE }}
+
+      - name: Configure approved development runtime settings
+        if: github.event_name == 'workflow_dispatch' && inputs.configure_runtime
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import secrets
+          import subprocess
+          import sys
+
+          def azure(*args):
+              result = subprocess.run(
+                  ["az", *args, "--only-show-errors", "-o", "json"],
+                  capture_output=True, text=True,
+              )
+              if result.returncode:
+                  print("::error::Could not configure development runtime settings with the deployment identity.")
+                  sys.exit(1)
+              return json.loads(result.stdout) if result.stdout.strip() else None
+
+          app = next((item for item in azure("webapp", "list") if item["name"] == "jess-admissions-dev"), None)
+          if not app:
+              print("::error::Development App Service was not found.")
+              sys.exit(1)
+          target = ["--name", app["name"], "--resource-group", app["resourceGroup"]]
+          current = azure("webapp", "config", "appsettings", "list", *target)
+          configured = {item["name"] for item in current if item.get("value", "").strip()}
+          settings = ["APPLICATIONS_PORTAL_URL=https://appsdev.jess.sch.ae"]
+          if "SESSION_SECRET" not in configured:
+              secret = secrets.token_urlsafe(48)
+              print(f"::add-mask::{secret}", flush=True)
+              settings.append(f"SESSION_SECRET={secret}")
+          azure("webapp", "config", "appsettings", "set", *target, "--settings", *settings)
+          print("Approved development Portal URL configured; independent session secret is present. No existing session secret was replaced.")
+          PY
 
       - name: 'Deploy to Azure Web App'
         id: deploy-to-webapp

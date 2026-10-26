@@ -167,6 +167,11 @@ App Service, then checks `/api/health`. It uses the repository's Azure OIDC secr
 and does not provision resources or set application credentials. The older
 `admissions-crm` deployment workflow is manual-only so development pushes do not
 deploy to a second app.
+For initial development setup, the deployment workflow's manual `configure_runtime`
+option configures the approved Portal origin `https://appsdev.jess.sch.ae` and
+generates an independent `SESSION_SECRET` only if that setting is missing. Generated
+values are masked, captured Azure responses are not logged, and existing session
+secrets are preserved. This option is off by default and never runs on a push.
 
 Enable a managed identity and create its SQL user if using managed identity.
 On first startup, the identity needs DDL rights to create Admissions tables and
