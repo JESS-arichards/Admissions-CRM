@@ -5,11 +5,6 @@ on:
     paths:
       - .github/workflows/development_diagnostics.yml
   workflow_dispatch:
-    inputs:
-      sync_shared_settings:
-        description: Copy the Portal's shared Entra, Graph and mail settings to Admissions development
-        type: boolean
-        default: false
 permissions:
   contents: read
   id-token: write
@@ -22,67 +17,6 @@ jobs:
           client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_5529A7BE1E4A4E16B4016DE1EFD941C0 }}
           tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_37920CDA620E49D5A242A07097CDF52F }}
           subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_287F7E66FDFB4243BD22FD3A88C4C8CE }}
-      - name: Compare shared settings with the Portal without disclosing values
-        shell: bash
-        env:
-          SYNC: ${{ github.event_name == 'workflow_dispatch' && inputs.sync_shared_settings }}
-        run: |
-          python - <<'PY'
-          import json
-          import os
-          import subprocess
-          import sys
-
-          SHARED = [
-              "ENTRA_TENANT_ID", "ENTRA_CLIENT_ID", "ENTRA_CLIENT_SECRET", "ENTRA_ALLOWED_DOMAINS",
-              "GRAPH_TENANT_ID", "GRAPH_CLIENT_ID", "GRAPH_CLIENT_SECRET", "MAIL_FROM_ADDRESS", "INITIAL_ADMIN_EMAIL",
-          ]
-
-          def azure(*args):
-              result = subprocess.run(["az", *args, "--only-show-errors", "-o", "json"], capture_output=True, text=True, timeout=120)
-              if result.returncode:
-                  print("::error::Azure operation failed; response withheld to protect credentials.")
-                  sys.exit(1)
-              return json.loads(result.stdout) if result.stdout.strip() else None
-
-          apps = {item["name"]: item for item in azure("webapp", "list")}
-          missing_apps = [name for name in ("jess-application-portal-dev", "jess-admissions-dev") if name not in apps]
-          if missing_apps:
-              print("::error::The deployment identity cannot see:", ", ".join(missing_apps))
-              sys.exit(1)
-
-          def settings(name):
-              target = ["--name", name, "--resource-group", apps[name]["resourceGroup"]]
-              values = {item["name"]: (item.get("value") or "").strip() for item in azure("webapp", "config", "appsettings", "list", *target)}
-              for key in SHARED:
-                  value = values.get(key, "")
-                  if len(value) >= 4:
-                      print(f"::add-mask::{value}", flush=True)
-              return target, values
-
-          _, portal = settings("jess-application-portal-dev")
-          target, admissions = settings("jess-admissions-dev")
-          differences = []
-          print("Setting | Portal | Admissions | Same")
-          for key in SHARED:
-              same = portal.get(key, "") == admissions.get(key, "")
-              if not same:
-                  differences.append(key)
-              print(f"{key} | {'set' if portal.get(key) else 'unset'} | {'set' if admissions.get(key) else 'unset'} | {'yes' if same else 'NO'}")
-
-          if os.environ.get("SYNC") == "true" and differences:
-              updates = [f"{key}={portal[key]}" for key in differences if portal.get(key)]
-              removals = [key for key in differences if not portal.get(key)]
-              if updates:
-                  azure("webapp", "config", "appsettings", "set", *target, "--settings", *updates)
-              if removals:
-                  azure("webapp", "config", "appsettings", "delete", *target, "--setting-names", *removals)
-              print("Synchronised from the Portal:", ", ".join(differences))
-          elif differences:
-              print("::warning::Shared settings differ from the Portal:", ", ".join(differences))
-          else:
-              print("All shared Entra, Graph and mail settings match the Portal.")
-          PY
       - name: Inspect startup without disclosing credentials
         shell: bash
         run: |
