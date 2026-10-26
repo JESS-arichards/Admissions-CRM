@@ -77,6 +77,50 @@ jobs:
           slot-name: 'Production'
           package: deployment
 
+      - name: Diagnose runtime configuration
+        if: always()
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import subprocess
+          import sys
+
+          def azure(*args):
+              result = subprocess.run(
+                  ["az", *args, "--only-show-errors", "-o", "json"],
+                  capture_output=True, text=True,
+              )
+              if result.returncode:
+                  print("::error::Could not inspect development configuration with the deployment identity.")
+                  sys.exit(1)
+              return json.loads(result.stdout)
+
+          apps = azure("webapp", "list")
+          app = next((item for item in apps if item["name"] == "jess-admissions-dev"), None)
+          if not app:
+              print("::error::Development App Service was not found.")
+              sys.exit(1)
+          settings = azure(
+              "webapp", "config", "appsettings", "list",
+              "--name", app["name"], "--resource-group", app["resourceGroup"],
+          )
+          configured = {item["name"] for item in settings if item.get("value", "").strip()}
+          required = {
+              "NODE_ENV", "PUBLIC_BASE_URL", "APPLICATIONS_PORTAL_URL",
+              "PLATFORM_API_KEY", "SESSION_SECRET", "ENTRA_TENANT_ID", "ENTRA_CLIENT_ID",
+          }
+          missing = sorted(required - configured)
+          if not ({"SQL_CONNECTION_STRING", "SQLAZURECONNSTR_DefaultConnection"} & configured):
+              missing += sorted({"SQL_SERVER", "SQL_DATABASE"} - configured)
+          for name in missing:
+              print(f"::error::Missing required App Service setting: {name}")
+          if missing:
+              print("::error::Configure the development settings described in README.md, then rerun deployment.")
+              sys.exit(1)
+          print("Required runtime setting names are present; credential validity and database connectivity still require startup validation.")
+          PY
+
       - name: Verify development health
         shell: bash
         run: |
