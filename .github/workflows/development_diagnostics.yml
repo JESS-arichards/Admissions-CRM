@@ -1,0 +1,67 @@
+name: Diagnose Admissions development startup
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  id-token: write
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZUREAPPSERVICE_CLIENTID_5529A7BE1E4A4E16B4016DE1EFD941C0 }}
+          tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_37920CDA620E49D5A242A07097CDF52F }}
+          subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_287F7E66FDFB4243BD22FD3A88C4C8CE }}
+      - name: Inspect startup without disclosing credentials
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          import tempfile
+          import zipfile
+
+          def azure(*args):
+              result = subprocess.run(["az", *args, "--only-show-errors", "-o", "json"], capture_output=True, text=True, timeout=120)
+              if result.returncode:
+                  raise RuntimeError("Azure diagnostic operation failed; response withheld to protect credentials.")
+              return json.loads(result.stdout) if result.stdout.strip() else None
+
+          app = next(item for item in azure("webapp", "list") if item["name"] == "jess-admissions-dev")
+          target = ["--name", app["name"], "--resource-group", app["resourceGroup"]]
+          config = azure("webapp", "config", "show", *target)
+          print("Runtime:", config.get("linuxFxVersion") if re.fullmatch(r"NODE\|[\d\w.-]+", config.get("linuxFxVersion", ""), re.I) else "not a recognised Node runtime")
+          command = config.get("appCommandLine", "").strip()
+          print("Startup command:", command if command in ("", "npm start", "node dist/server/index.js") else "custom command present (withheld)")
+          settings = {item["name"]: item.get("value", "") for item in azure("webapp", "config", "appsettings", "list", *target)}
+          for key in ("PLATFORM_API_KEY", "SESSION_SECRET"):
+              print(key + " length valid:", len(settings.get(key, "")) >= 32)
+          for key in ("ENTRA_TENANT_ID", "ENTRA_CLIENT_ID"):
+              print(key + " UUID format valid:", bool(re.fullmatch(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", settings.get(key, ""))))
+          print("NODE_ENV production:", settings.get("NODE_ENV") == "production")
+          print("Graph configuration complete or disabled:", sum(bool(settings.get(key)) for key in ("GRAPH_TENANT_ID", "GRAPH_CLIENT_ID", "GRAPH_CLIENT_SECRET", "MAIL_FROM_ADDRESS")) in (0, 4))
+          categories = [
+              "ERR_MODULE_NOT_FOUND", "MODULE_NOT_FOUND", "ZodError", "ELOGIN", "ETIMEOUT", "ECONNREFUSED",
+              "ENOTFOUND", "Login failed for user", "Cannot find module", "Missing script",
+              "Admissions could not start", "Invalid environment", "Could not acquire Admissions migration lock",
+              "SQL authentication requires", "Configure all four Graph email settings",
+              "Failed to connect", "CREATE TABLE permission denied", "CREATE DATABASE permission denied",
+          ]
+          with tempfile.TemporaryDirectory() as directory:
+              archive = os.path.join(directory, "logs.zip")
+              try:
+                  azure("webapp", "log", "download", *target, "--log-file", archive)
+                  found = set()
+                  with zipfile.ZipFile(archive) as logs:
+                      for name in logs.namelist():
+                          if name.endswith("/") or logs.getinfo(name).file_size > 20000000:
+                              continue
+                          text = logs.read(name).decode("utf-8", errors="replace")
+                          found.update(category for category in categories if category in text)
+                  print("Recognised startup error categories:", ", ".join(sorted(found)) or "none")
+              except Exception:
+                  print("Startup log archive unavailable; no raw logs or credentials were printed.")
+          PY
