@@ -1,5 +1,9 @@
 name: Diagnose Admissions development startup
 on:
+  push:
+    branches: [development]
+    paths:
+      - .github/workflows/development_diagnostics.yml
   workflow_dispatch:
 permissions:
   contents: read
