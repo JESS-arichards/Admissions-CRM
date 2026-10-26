@@ -47,6 +47,8 @@ jobs:
               print(key + " UUID format valid:", bool(re.fullmatch(r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", settings.get(key, ""))))
           print("NODE_ENV production:", settings.get("NODE_ENV") == "production")
           print("Graph configuration complete or disabled:", sum(bool(settings.get(key)) for key in ("GRAPH_TENANT_ID", "GRAPH_CLIENT_ID", "GRAPH_CLIENT_SECRET", "MAIL_FROM_ADDRESS")) in (0, 4))
+          for key in ("GRAPH_TENANT_ID", "GRAPH_CLIENT_ID", "GRAPH_CLIENT_SECRET", "MAIL_FROM_ADDRESS"):
+              print(key + " configured:", bool(settings.get(key, "").strip()))
           categories = [
               "ERR_MODULE_NOT_FOUND", "MODULE_NOT_FOUND", "ZodError", "ELOGIN", "ETIMEOUT", "ECONNREFUSED",
               "ENOTFOUND", "Login failed for user", "Cannot find module", "Missing script",
