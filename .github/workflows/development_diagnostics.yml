@@ -84,13 +84,28 @@ jobs:
               try:
                   azure("webapp", "log", "download", *target, "--log-file", archive)
                   found = set()
+                  latest = None
                   with zipfile.ZipFile(archive) as logs:
-                      for name in logs.namelist():
-                          if name.endswith("/") or logs.getinfo(name).file_size > 20000000:
-                              continue
-                          text = logs.read(name).decode("utf-8", errors="replace")
+                      entries = [info for info in logs.infolist() if not info.is_dir() and info.file_size <= 20000000]
+                      for info in sorted(entries, key=lambda item: item.date_time):
+                          text = logs.read(info.filename).decode("utf-8", errors="replace")
                           found.update(category for category in categories if category in text)
-                  print("Recognised startup error categories:", ", ".join(sorted(found)) or "none")
+                          for line in text.splitlines():
+                              if "Admissions could not start" in line:
+                                  latest = (info.date_time, line)
+                  print("Recognised startup error categories (all retained logs):", ", ".join(sorted(found)) or "none")
+                  if latest:
+                      line = latest[1]
+                      try:
+                          err = json.loads(line[line.index("{"):]).get("err", {})
+                      except Exception:
+                          err = {}
+                      def redact(value):
+                          value = re.sub(r"(?i)(password|pwd|secret|key|token|sig)=[^;&\s]+", r"\1=<redacted>", str(value))
+                          return re.sub(r"[A-Za-z0-9+/_-]{32,}={0,2}", "<redacted>", value)[:300]
+                      print("Latest startup failure log time:", "-".join(str(part) for part in latest[0]))
+                      print("Latest startup failure type/code:", redact(err.get("type") or err.get("name")), redact(err.get("code")))
+                      print("Latest startup failure message:", redact(err.get("message", "unparsed")))
               except Exception:
                   print("Startup log archive unavailable; no raw logs or credentials were printed.")
           PY
