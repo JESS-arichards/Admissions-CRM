@@ -71,7 +71,7 @@ export async function migrate() {
           requestId int NOT NULL REFERENCES dbo.AdmissionsRequests(id),
           stage nvarchar(30) NOT NULL,
           publicMessage nvarchar(2000) NOT NULL DEFAULT N'',
-          internalNote nvarchar(4200) NOT NULL DEFAULT N'',
+          internalNote nvarchar(max) NOT NULL DEFAULT N'',
           actorId int NULL,
           actorName nvarchar(200) NOT NULL,
           isPublic bit NOT NULL,
@@ -259,7 +259,7 @@ export async function updateRequest(id: number, data: RequestUpdate, user: Centr
     if (result.rowsAffected[0] !== 1) throw conflict();
     await new sql.Request(tx).input('id', sql.Int, id).input('stage', sql.NVarChar(30), data.stage)
       .input('public', sql.NVarChar(2000), data.publicMessage)
-      .input('internal', sql.NVarChar(4200), [
+      .input('internal', sql.NVarChar(sql.MAX), [
         data.assignment === 'me' ? 'Assigned to the acting staff member.' : data.assignment === 'unassigned' ? 'Request unassigned.' : '',
         data.internalNote,
       ].filter(Boolean).join('\n'))

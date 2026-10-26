@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { CentralUser, NewRequest } from '../shared/contracts.js';
 import { hashSecret } from './secrets.js';
+import sql from 'mssql';
 
 const state = vi.hoisted(() => ({
   calls: [] as { query: string; inputs: Record<string, unknown> }[],
@@ -23,12 +24,34 @@ vi.mock('mssql', () => {
   class ConnectionPool { on() {} request() { return new Request(); } }
   return { default: {
     ConnectionPool, Request, Transaction, ISOLATION_LEVEL: { SERIALIZABLE: 4 },
-    Char: vi.fn(), VarChar: vi.fn(), NVarChar: vi.fn(), Int: 'int', Bit: 'bit', MAX: 'max',
+    Char: vi.fn(), VarChar: vi.fn(), NVarChar: vi.fn((length: number | string) => {
+      if (typeof length === 'number' && length > 4000) throw new Error('SQL Server nvarchar length exceeds 4000.');
+      return { length };
+    }), Int: 'int', Bit: 'bit', MAX: 'max',
   } };
 });
 import * as db from './db.js';
 const user: CentralUser = { id: 1, email: 'staff@example.test', displayName: 'Staff', roles: ['Admissions Admin'], isActive: true, sessionVersion: 0 };
 beforeEach(() => { state.calls.length = 0; state.results.length = 0; vi.clearAllMocks(); });
+describe('SQL Server note storage', () => {
+  it('uses MAX in the startup schema instead of an invalid fixed length above 4000', async () => {
+    await db.migrate();
+    const schema = state.calls[0].query;
+    expect(schema).toContain("internalNote nvarchar(max) NOT NULL");
+    const lengths = [...schema.matchAll(/nvarchar\((\d+)\)/gi)].map((match) => Number(match[1]));
+    expect(lengths.length).toBeGreaterThan(0);
+    expect(lengths.every((length) => length <= 4000)).toBe(true);
+  });
+  it('preserves a full-length staff note plus assignment audit text', async () => {
+    state.results.push({ recordset: [{ stage: 'New' }] });
+    const note = 'x'.repeat(4000);
+    await db.updateRequest(4, { revision: 1, stage: 'New', publicMessage: '', internalNote: note, assignment: 'me' }, user);
+    expect(sql.NVarChar).toHaveBeenCalledWith(sql.MAX);
+    expect(state.calls[2].inputs.internal).toBe(`Assigned to the acting staff member.\n${note}`);
+    expect(state.calls[2].inputs.visible).toBe(false);
+    expect(state.commit).toHaveBeenCalledOnce();
+  });
+});
 describe('persisted request privacy', () => {
   it('stores only a digest of the tracking code and queues confirmation atomically', async () => {
     state.results.push({ recordset: [{ id: 4 }] });

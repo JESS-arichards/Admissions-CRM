@@ -99,7 +99,7 @@ There is no fake-data mode or silent email-to-console fallback.
 | `APPLICATIONS_PORTAL_URL` | Portal's matching-environment `PUBLIC_BASE_URL`; used for central API, brand and profile |
 | `PLATFORM_API_KEY` | Server-only secret matching Portal `PLATFORM_ADMISSIONS_KEY`, minimum 32 characters |
 | `SESSION_SECRET` | Separate random Admissions cookie-signing secret, minimum 32 characters |
-| `ENTRA_TENANT_ID`, `ENTRA_CLIENT_ID` | Same tenant and SPA application registration as Portal |
+| `ENTRA_TENANT_ID`, `ENTRA_CLIENT_ID` | Same names and matching-environment values as Portal; both are required |
 | `SQL_CONNECTION_STRING` | Admissions DB connection string; Azure `SQLAZURECONNSTR_DefaultConnection` also supported |
 | `SQL_SERVER`, `SQL_DATABASE` | Alternative to a connection string |
 | `SQL_AUTH` | `managed-identity` (default) or `sql` |
@@ -120,12 +120,37 @@ Use independent credentials, databases and registrations/configuration per envir
 Use HTTPS for all production traffic. A production cookie is Secure, HttpOnly and
 SameSite=Strict, scoped to Admissions with its own name and eight-hour lifetime.
 
+### Consistent identity and mail settings across applications
+
+Use the Portal's existing setting names and the same values within the matching
+environment for `ENTRA_TENANT_ID`, `ENTRA_CLIENT_ID`, `GRAPH_CLIENT_SECRET` and
+`MAIL_FROM_ADDRESS`. No additional `GRAPH_TENANT_ID` or `GRAPH_CLIENT_ID` is required
+when mail uses the Entra registration: both default to their `ENTRA_*` equivalents,
+just as in the Portal. Explicit Graph overrides remain supported for a different
+mail registration; its secret must belong to that registration.
+
+`ENTRA_CLIENT_SECRET`, if present in the shared configuration, is not needed for
+browser SPA sign-in and is not substituted for `GRAPH_CLIENT_SECRET`.
+`ENTRA_ALLOWED_DOMAINS` and `INITIAL_ADMIN_EMAIL` remain Portal-owned: Admissions
+delegates identity verification and domain restrictions to the Portal and never
+bootstraps an administrator locally. Copying an initial-admin setting into Admissions
+does not grant access. Assign Admissions roles centrally in Portal Admin > Users.
+
+Setting names should stay consistent, but not every value is shared:
+`SESSION_SECRET`, SQL database configuration and each app's `PUBLIC_BASE_URL` must
+remain app-specific. Admissions `PLATFORM_API_KEY` must match the Portal's
+`PLATFORM_ADMISSIONS_KEY`. Shared configuration is not automatically synchronised
+between Azure App Services; configure the same environment-scoped values or Key
+Vault references when provisioning each app. Do not share development credentials
+with production.
+
 ### Email setup and reliability
 
 Grant the email app Microsoft Graph **application** `Mail.Send` permission with admin
 consent. Restrict its mailbox scope using Exchange application access controls.
-`MAIL_FROM_ADDRESS` must be a mailbox this app is allowed to send as; it is independent
-of the Portal notification mailbox and is not taken from shared branding.
+`MAIL_FROM_ADDRESS` must be a mailbox this app is allowed to send as. It can use the
+same configured address as the Portal; Admissions reads the environment setting,
+not the Portal's branding-level notification-address override.
 
 Confirmation is explicit (a button on the email landing page, not a GET side effect).
 Confirmation secrets are in URL fragments, removed from browser history by the page,
