@@ -206,6 +206,15 @@ serialised with `sp_getapplock`. SQL schema uses `Admissions*` tables; central u
 and branding are never migrated/copied. Coordinate schema privileges with your DBA;
 do not grant access to the Portal database.
 
+To configure the Admissions database manually (for example when the app identity
+lacks DDL rights), run [database/schema.sql](database/schema.sql) against the
+**Admissions** database with SSMS, the Azure SQL query editor or
+`sqlcmd -S <server> -d <admissions-db> -G -b -i database\schema.sql`. It only creates
+missing tables, indexes and starter pages, never replaces existing data, and is safe
+to rerun. It records schema version 1, so startup skips its own migration afterwards.
+The central Admissions roles live in the Portal database and are created by the
+Portal's own `database/schema.sql` (migration v22).
+
 Add the deployed `https://<admissions-host>/auth/callback.html` SPA redirect URI to
 the Portal's Entra registration. MSAL 5 uses a dedicated redirect bridge page for
 popup sign-in; this page must stay free of application routing/bootstrap code.
