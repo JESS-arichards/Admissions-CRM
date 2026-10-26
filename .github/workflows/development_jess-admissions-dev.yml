@@ -9,6 +9,10 @@ on:
       - 'development'
   workflow_dispatch:
 
+concurrency:
+  group: admissions-development
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -19,21 +23,26 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Set up Node.js version
-        uses: actions/setup-node@v3
+        uses: actions/setup-node@v4
         with:
           node-version: '24.x'
+          cache: npm
 
-      - name: npm install, build, and test
+      - name: Validate and package application
         run: |
-          npm install
-          npm run build --if-present
-          npm run test --if-present
+          npm ci
+          npm run typecheck
+          npm test
+          npm run build
+          npm prune --omit=dev
+          tar -czf deployment.tar.gz dist node_modules package.json package-lock.json
 
       - name: Upload artifact for deployment job
         uses: actions/upload-artifact@v4
         with:
-          name: node-app
-          path: .
+          name: admissions-development
+          path: deployment.tar.gz
+          retention-days: 3
 
   deploy:
     runs-on: ubuntu-latest
@@ -46,8 +55,13 @@ jobs:
       - name: Download artifact from build job
         uses: actions/download-artifact@v4
         with:
-          name: node-app
-      
+          name: admissions-development
+
+      - name: Extract runtime package
+        run: |
+          mkdir deployment
+          tar -xzf deployment.tar.gz -C deployment
+
       - name: Login to Azure
         uses: azure/login@v2
         with:
@@ -61,5 +75,15 @@ jobs:
         with:
           app-name: 'jess-admissions-dev'
           slot-name: 'Production'
-          package: .
-          
+          package: deployment
+
+      - name: Verify development health
+        shell: bash
+        run: |
+          set -euo pipefail
+          host=$(az webapp list --query "[?name=='jess-admissions-dev'].defaultHostName | [0]" -o tsv)
+          if [ -z "$host" ]; then
+            echo "::error::Could not resolve the development web app hostname."
+            exit 1
+          fi
+          curl --fail --silent --show-error --retry 12 --retry-all-errors --retry-delay 10 --max-time 20 "https://$host/api/health"

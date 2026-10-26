@@ -1,0 +1,221 @@
+import { once } from 'node:events';
+import type { AddressInfo } from 'node:net';
+import type { Server } from 'node:http';
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { SignJWT } from 'jose';
+import type { CentralUser } from '../shared/contracts.js';
+
+const fixtures = vi.hoisted(() => ({
+  config: {
+    NODE_ENV: 'test', PUBLIC_BASE_URL: 'http://localhost:5174', APPLICATIONS_PORTAL_URL: 'https://portal.example.test',
+    ENTRA_CLIENT_ID: '11111111-1111-4111-8111-111111111111', ENTRA_TENANT_ID: '22222222-2222-4222-8222-222222222222',
+    SESSION_SECRET: 'test-only-independent-session-secret-123456', PLATFORM_API_KEY: 'test-only-platform-key-123456789012345678',
+    TRUST_PROXY_HOPS: 0, emailEnabled: true, LOG_LEVEL: 'silent',
+  },
+  user: {
+    id: 7, email: 'staff@example.test', displayName: 'Admissions Staff', isActive: true, sessionVersion: 3,
+    roles: ['Admissions Admin'],
+  } as CentralUser,
+}));
+vi.mock('./config.js', () => ({ config: fixtures.config }));
+vi.mock('./db.js', () => ({
+  pool: { request: () => ({ query: vi.fn().mockResolvedValue({}) }) },
+  createRequest: vi.fn(), getProgress: vi.fn(), setNotifications: vi.fn(), verifyNotifications: vi.fn(),
+  listRequests: vi.fn(), getRequest: vi.fn(), updateRequest: vi.fn(), getPages: vi.fn(), updatePage: vi.fn(),
+}));
+vi.mock('./platform.js', () => ({
+  centralUser: vi.fn(), centralSession: vi.fn(), getBrand: vi.fn(), portalFetch: vi.fn(),
+}));
+import * as db from './db.js';
+import * as platform from './platform.js';
+import { createApp } from './app.js';
+import { cookieName, sessionToken } from './auth.js';
+import { HttpError } from './errors.js';
+import { hashSecret } from './secrets.js';
+
+let server: Server;
+let base: string;
+let cookie: string;
+const requestBody = {
+  kind: 'Enquiry', parentName: 'Parent', email: 'parent@example.test', phone: '', yearGroup: 'Year 3',
+  message: 'Could you tell me about admissions?', emailOptIn: false, privacyAccepted: true, website: '',
+};
+async function call(route: string, method = 'GET', body?: unknown, staff = false, origin = fixtures.config.PUBLIC_BASE_URL) {
+  return fetch(`${base}${route}`, {
+    method, headers: {
+      'Content-Type': 'application/json', Origin: origin, ...(staff ? { Cookie: cookie } : {}),
+    }, ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  });
+}
+beforeAll(async () => {
+  server = createApp().listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  cookie = `${cookieName}=${await sessionToken(fixtures.user)}`;
+});
+afterAll(async () => { await new Promise<void>((resolve) => server.close(() => resolve())); });
+beforeEach(() => {
+  vi.resetAllMocks();
+  fixtures.user.roles = ['Admissions Admin']; fixtures.user.isActive = true; fixtures.user.sessionVersion = 3;
+  fixtures.config.emailEnabled = true;
+  vi.mocked(platform.centralUser).mockImplementation(async () => ({ ...fixtures.user }));
+  vi.mocked(platform.centralSession).mockImplementation(async () => ({ ...fixtures.user }));
+  vi.mocked(db.getPages).mockResolvedValue([]);
+  vi.mocked(db.listRequests).mockResolvedValue({ items: [], hasMore: false });
+});
+describe('anonymous request flow', () => {
+  it('creates a cryptographically random tracking secret and does not expose the database id', async () => {
+    const response = await call('/api/requests', 'POST', requestBody);
+    expect(response.status).toBe(201);
+    const result = await response.json();
+    expect(result).toEqual({ code: expect.stringMatching(/^[A-Za-z0-9_-]{32}$/), notifications: 'off' });
+    expect(response.headers.get('cache-control')).toBe('no-store');
+    expect(db.createRequest).toHaveBeenCalledWith(expect.objectContaining({ parentName: 'Parent' }), result.code, null);
+    expect(hashSecret(result.code)).not.toContain(result.code);
+  });
+  it('queues verification only when requested and configured', async () => {
+    const response = await call('/api/requests', 'POST', { ...requestBody, emailOptIn: true });
+    expect(response.status).toBe(201);
+    expect(db.createRequest).toHaveBeenCalledWith(expect.anything(), expect.any(String), expect.stringMatching(/^[A-Za-z0-9_-]{32}$/));
+    const args = vi.mocked(db.createRequest).mock.calls[0];
+    expect(args[1]).not.toBe(args[2]);
+  });
+  it('fails explicitly rather than claiming unconfigured email will work', async () => {
+    fixtures.config.emailEnabled = false;
+    expect((await call('/api/requests', 'POST', { ...requestBody, emailOptIn: true })).status).toBe(503);
+    expect(db.createRequest).not.toHaveBeenCalled();
+  });
+  it('rejects missing privacy consent and does not persist', async () => {
+    expect((await call('/api/requests', 'POST', { ...requestBody, privacyAccepted: false })).status).toBe(400);
+    expect(db.createRequest).not.toHaveBeenCalled();
+  });
+  it('rejects cross-origin writes', async () => {
+    expect((await call('/api/requests', 'POST', requestBody, false, 'https://other.example.test')).status).toBe(403);
+    expect(db.createRequest).not.toHaveBeenCalled();
+  });
+  it('does not expose internal errors or submitted PII', async () => {
+    vi.mocked(db.getProgress).mockRejectedValue(new Error('SQL error parent@example.test secret'));
+    const response = await call('/api/tracking', 'POST', { code: 'a'.repeat(32) });
+    expect(response.status).toBe(500);
+    const body = await response.text();
+    expect(body).not.toContain('parent@example.test');
+    expect(body).not.toContain('SQL error');
+  });
+  it('returns a missing-request error for an unknown code', async () => {
+    vi.mocked(db.getProgress).mockRejectedValue(new HttpError(404, 'Request not found.'));
+    expect((await call('/api/tracking', 'POST', { code: 'a'.repeat(32) })).status).toBe(404);
+  });
+});
+describe('staff access', () => {
+  it('rejects anonymous staff access', async () => {
+    expect((await call('/api/staff/requests')).status).toBe(401);
+    expect(db.listRequests).not.toHaveBeenCalled();
+  });
+  it('honours Full Admin without a separate Admissions role', async () => {
+    fixtures.user.roles = ['Full Admin'];
+    expect((await call('/api/staff/pages', 'GET', undefined, true)).status).toBe(200);
+  });
+  it('lets contributors manage requests but not administer content', async () => {
+    fixtures.user.roles = ['Admissions Contributor'];
+    expect((await call('/api/staff/requests', 'GET', undefined, true)).status).toBe(200);
+    expect((await call('/api/staff/pages', 'GET', undefined, true)).status).toBe(403);
+  });
+  it.each(['Staff', 'Learn Admin', 'Parent'])('rejects central users with only %s', async (role) => {
+    fixtures.user.roles = [role];
+    expect((await call('/api/staff/requests', 'GET', undefined, true)).status).toBe(403);
+  });
+  it('checks central roles on every authenticated request', async () => {
+    expect((await call('/api/staff/requests', 'GET', undefined, true)).status).toBe(200);
+    fixtures.user.roles = [];
+    expect((await call('/api/staff/requests', 'GET', undefined, true)).status).toBe(403);
+    expect(platform.centralUser).toHaveBeenCalledTimes(2);
+  });
+  it('ends access immediately when the central user is disabled', async () => {
+    fixtures.user.isActive = false;
+    expect((await call('/api/staff/requests', 'GET', undefined, true)).status).toBe(401);
+  });
+  it('ends sessions when the central session version changes', async () => {
+    fixtures.user.sessionVersion = 4;
+    expect((await call('/api/staff/requests', 'GET', undefined, true)).status).toBe(401);
+  });
+  it('fails closed on central API outage', async () => {
+    vi.mocked(platform.centralUser).mockRejectedValue(new HttpError(503, 'Central API unavailable.'));
+    expect((await call('/api/staff/requests', 'GET', undefined, true)).status).toBe(503);
+    expect(db.listRequests).not.toHaveBeenCalled();
+  });
+  it('rejects an expired token', async () => {
+    const old = cookie;
+    const token = await new SignJWT({ sv: 3 }).setProtectedHeader({ alg: 'HS256' }).setSubject('7')
+      .setIssuer('jess-admissions').setAudience('admissions-staff').setExpirationTime(1)
+      .sign(new TextEncoder().encode(fixtures.config.SESSION_SECRET));
+    cookie = `${cookieName}=${token}`;
+    try { expect((await call('/api/staff/requests', 'GET', undefined, true)).status).toBe(401); }
+    finally { cookie = old; }
+    expect(platform.centralUser).not.toHaveBeenCalled();
+  });
+  it('validates login through the central platform before issuing a separate cookie', async () => {
+    const response = await call('/api/auth/session', 'POST', { idToken: 'verified-by-central-platform-token' });
+    expect(response.status).toBe(200);
+    expect(platform.centralSession).toHaveBeenCalledWith('verified-by-central-platform-token');
+    const issued = response.headers.get('set-cookie');
+    expect(issued).toContain('admissions_session=');
+    expect(issued).toContain('HttpOnly');
+    expect(issued).toContain('SameSite=Strict');
+  });
+  it('rejects sign-in without an Admissions role and issues no cookie', async () => {
+    fixtures.user.roles = ['Staff'];
+    const response = await call('/api/auth/session', 'POST', { idToken: 'verified-by-central-platform-token' });
+    expect(response.status).toBe(403);
+    expect(response.headers.get('set-cookie')).toBeNull();
+  });
+  it('retains optimistic concurrency conflict errors', async () => {
+    vi.mocked(db.updateRequest).mockRejectedValue(new HttpError(409, 'Reload before saving.', 'REVISION_CONFLICT'));
+    const response = await call('/api/staff/requests/1', 'PATCH', { revision: 1, stage: 'In progress' }, true);
+    expect(response.status).toBe(409);
+    expect((await response.json()).code).toBe('REVISION_CONFLICT');
+  });
+});
+describe('notification endpoints', () => {
+  it('requires the complete tracking secret to change preferences', async () => {
+    expect((await call('/api/tracking/notifications', 'POST', { code: '123', enabled: true })).status).toBe(400);
+    expect(db.setNotifications).not.toHaveBeenCalled();
+  });
+  describe('public submission limits', () => {
+    it('accepts five submissions per IP per hour and rejects the sixth', async () => {
+      const limitedServer = createApp().listen(0, '127.0.0.1');
+      await once(limitedServer, 'listening');
+      const url = `http://127.0.0.1:${(limitedServer.address() as AddressInfo).port}/api/requests`;
+      try {
+        for (let i = 0; i < 5; i++) {
+          const response = await fetch(url, {
+            method: 'POST', headers: { 'Content-Type': 'application/json', Origin: fixtures.config.PUBLIC_BASE_URL },
+            body: JSON.stringify(requestBody),
+          });
+          expect(response.status).toBe(201);
+        }
+        const blocked = await fetch(url, {
+          method: 'POST', headers: { 'Content-Type': 'application/json', Origin: fixtures.config.PUBLIC_BASE_URL },
+          body: JSON.stringify(requestBody),
+        });
+        expect(blocked.status).toBe(429);
+        expect(await blocked.json()).toMatchObject({ code: 'RATE_LIMITED' });
+        expect(db.createRequest).toHaveBeenCalledTimes(5);
+      } finally { await new Promise<void>((resolve) => limitedServer.close(() => resolve())); }
+    });
+  });
+  it('allows opt-out even when email is no longer configured', async () => {
+    fixtures.config.emailEnabled = false;
+    expect((await call('/api/tracking/notifications', 'POST', { code: 'a'.repeat(32), enabled: false })).status).toBe(200);
+    expect(db.setNotifications).toHaveBeenCalledWith('a'.repeat(32), false, expect.any(String));
+  });
+  it('confirms using a separate token without issuing a session', async () => {
+    const response = await call('/api/notifications/confirm', 'POST', { token: 'b'.repeat(32) });
+    expect(response.status).toBe(200);
+    expect(db.verifyNotifications).toHaveBeenCalledWith('b'.repeat(32));
+    expect(response.headers.get('set-cookie')).toBeNull();
+  });
+  it('surfaces expired confirmation links', async () => {
+    vi.mocked(db.verifyNotifications).mockRejectedValue(new HttpError(400, 'This confirmation link is expired.'));
+    expect((await call('/api/notifications/confirm', 'POST', { token: 'b'.repeat(32) })).status).toBe(400);
+  });
+});

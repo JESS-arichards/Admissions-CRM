@@ -1,0 +1,51 @@
+import { z } from 'zod';
+
+const optional = z.string().trim().optional().transform((v) => v || undefined);
+const bool = (fallback: boolean) => z.enum(['true', 'false']).optional().transform((v) => v === undefined ? fallback : v === 'true');
+const absoluteUrl = z.url().refine((value) => {
+  const url = new URL(value);
+  return !url.username && !url.password && !url.search && !url.hash && url.pathname === '/'
+    && (url.protocol === 'https:' || (process.env.NODE_ENV !== 'production'
+      && url.protocol === 'http:' && ['localhost', '127.0.0.1'].includes(url.hostname)));
+}, 'Use an HTTPS origin without path, credentials, query or fragment (localhost HTTP allowed in development).');
+
+const env = z.object({
+  NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
+  PORT: z.coerce.number().int().min(1).max(65535).default(8081),
+  PUBLIC_BASE_URL: absoluteUrl,
+  APPLICATIONS_PORTAL_URL: absoluteUrl,
+  PLATFORM_API_KEY: z.string().min(32),
+  SESSION_SECRET: z.string().min(32),
+  ENTRA_TENANT_ID: z.uuid(),
+  ENTRA_CLIENT_ID: z.uuid(),
+  SQL_CONNECTION_STRING: optional,
+  SQLAZURECONNSTR_DefaultConnection: optional,
+  SQL_SERVER: optional,
+  SQL_DATABASE: optional,
+  SQL_AUTH: z.enum(['sql', 'managed-identity']).default('managed-identity'),
+  SQL_USER: optional,
+  SQL_PASSWORD: optional,
+  SQL_MANAGED_IDENTITY_CLIENT_ID: optional,
+  SQL_ENCRYPT: bool(true),
+  SQL_TRUST_SERVER_CERTIFICATE: bool(false),
+  GRAPH_TENANT_ID: optional,
+  GRAPH_CLIENT_ID: optional,
+  GRAPH_CLIENT_SECRET: optional,
+  MAIL_FROM_ADDRESS: optional.pipe(z.email().optional()),
+  TRUST_PROXY_HOPS: z.coerce.number().int().min(0).max(5).default(0),
+  LOG_LEVEL: z.enum(['trace', 'debug', 'info', 'warn', 'error', 'fatal', 'silent']).default('info'),
+}).parse(process.env);
+
+if (!(env.SQL_CONNECTION_STRING || env.SQLAZURECONNSTR_DefaultConnection || (env.SQL_SERVER && env.SQL_DATABASE))) {
+  throw new Error('Configure the Admissions SQL database before starting.');
+}
+if (env.SQL_AUTH === 'sql' && !env.SQL_CONNECTION_STRING && !env.SQLAZURECONNSTR_DefaultConnection
+  && (!env.SQL_USER || !env.SQL_PASSWORD)) throw new Error('SQL authentication requires SQL_USER and SQL_PASSWORD.');
+const mailFields = [env.GRAPH_TENANT_ID, env.GRAPH_CLIENT_ID, env.GRAPH_CLIENT_SECRET, env.MAIL_FROM_ADDRESS];
+if (mailFields.some(Boolean) && !mailFields.every(Boolean)) throw new Error('Configure all four Graph email settings, or leave all unset.');
+export const config = {
+  ...env,
+  PUBLIC_BASE_URL: new URL(env.PUBLIC_BASE_URL).origin,
+  APPLICATIONS_PORTAL_URL: new URL(env.APPLICATIONS_PORTAL_URL).origin,
+  emailEnabled: mailFields.every(Boolean),
+};
