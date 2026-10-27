@@ -5,6 +5,7 @@ import type { Brand, Page, Progress } from '../../shared/contracts';
 import { KINDS } from '../../shared/contracts';
 import { Alert } from './App';
 import { api, errorMessage } from './api';
+import { Documents } from './Documents';
 
 const date = (value: string) => new Date(value).toLocaleString();
 export function Information({ pages, brand, home = false }: { pages: Page[]; brand: Brand; home?: boolean }) {
@@ -56,7 +57,8 @@ export function RequestForm({ emailEnabled, onCode }: { emailEnabled: boolean; o
   if (result) return <section className="panel narrow" role="status"><CheckCircle2 size={36} /><h1>We have your request</h1>
     <p>Save this private tracking code now. It is shown only once and cannot be recovered by email.</p>
     <code className="tracking-code">{result.code}</code>
-    <p>Anyone with this code can view your progress. Do not share it publicly. The code is case-sensitive.</p>
+    <p>Anyone with this code can view your progress and upload or download enquiry documents. Do not share it publicly. The code is case-sensitive.</p>
+    <p>Need to send a document? Open View progress, look up your code, then use Enquiry documents.</p>
     <div className="actions"><button onClick={() => {
       navigator.clipboard.writeText(result.code).then(() => setCopied(true)).catch((err: unknown) => setError(`Could not copy the code: ${errorMessage(err)}. Select and copy it manually.`));
     }}>{copied ? 'Copied' : 'Copy code'}</button><Link className="button primary" to="/track">View progress</Link></div>
@@ -65,7 +67,7 @@ export function RequestForm({ emailEnabled, onCode }: { emailEnabled: boolean; o
   </section>;
   return <section className="panel narrow"><p className="eyebrow">Let us help</p><h1>Make an admissions request</h1>
     <p>Send an enquiry or request a visit. This is not a formal application or a confirmed visit booking.</p>
-    <p>Please do not include sensitive child information or documents.</p>
+    <p>Please do not include sensitive child information in this message. If Admissions requests documents, submit this form first, then upload them privately on the tracking page using your code.</p>
     <form onSubmit={(event) => void submit(event)}>
       <fieldset disabled={busy}>
         <label>Request type<select name="kind" defaultValue={params.get('kind') === 'visit' ? 'Visit request' : 'Enquiry'}>{KINDS.map((kind) => <option key={kind}>{kind}</option>)}</select></label>
@@ -132,6 +134,7 @@ export function TrackRequest({ code, setCode, emailEnabled }: { code: string; se
         {progress.notifications !== 'off' && <button disabled={busy} onClick={() => void notifications(false)}>Turn off email updates</button>}
       </div>
       <p className="muted">Updates go only to the email address provided with your request. Your tracking code is never sent by email.</p>
+      <Documents key={activeCode} code={activeCode} />
     </div>}
   </section>;
 }

@@ -1,4 +1,5 @@
 import { once } from 'node:events';
+import { Readable } from 'node:stream';
 import type { AddressInfo } from 'node:net';
 import type { Server } from 'node:http';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -22,11 +23,16 @@ vi.mock('./db.js', () => ({
   pool: { request: () => ({ query: vi.fn().mockResolvedValue({}) }) },
   createRequest: vi.fn(), getProgress: vi.fn(), setNotifications: vi.fn(), verifyNotifications: vi.fn(),
   listRequests: vi.fn(), getRequest: vi.fn(), updateRequest: vi.fn(), getPages: vi.fn(), updatePage: vi.fn(),
+  authorizeDocuments: vi.fn(), listDocuments: vi.fn(), getDocument: vi.fn(), addDocument: vi.fn(),
+}));
+vi.mock('./documentStorage.js', () => ({
+  storageReady: vi.fn(), requireStorage: vi.fn(), uploadBlob: vi.fn(), deleteBlob: vi.fn(), downloadBlob: vi.fn(),
 }));
 vi.mock('./platform.js', () => ({
   centralUser: vi.fn(), centralSession: vi.fn(), getBrand: vi.fn(), portalFetch: vi.fn(),
 }));
 import * as db from './db.js';
+import * as storage from './documentStorage.js';
 import * as platform from './platform.js';
 import { createApp } from './app.js';
 import { cookieName, sessionToken } from './auth.js';
@@ -62,6 +68,172 @@ beforeEach(() => {
   vi.mocked(platform.centralSession).mockImplementation(async () => ({ ...fixtures.user }));
   vi.mocked(db.getPages).mockResolvedValue([]);
   vi.mocked(db.listRequests).mockResolvedValue({ items: [], hasMore: false });
+  vi.mocked(db.authorizeDocuments).mockResolvedValue(4);
+  vi.mocked(db.listDocuments).mockResolvedValue([]);
+  vi.mocked(storage.storageReady).mockResolvedValue(true);
+});
+describe('private enquiry documents', () => {
+  const code = 'd'.repeat(32), documentId = '11111111-1111-4111-8111-111111111111';
+  const bytes = Buffer.from(`%PDF-1.7\noriginal bytes\n${'x'.repeat(4096)}\n%%EOF`);
+  async function upload(staff = false, body: Buffer = bytes, extra: Record<string, string> = {}) {
+    return fetch(`${base}${staff ? '/api/staff/requests/4/documents' : '/api/tracking/documents'}`, {
+      method: 'POST', headers: {
+        'Content-Type': 'application/octet-stream', Origin: fixtures.config.PUBLIC_BASE_URL,
+        'X-Document-Name': encodeURIComponent('original.pdf'), ...(staff ? { Cookie: cookie } : { 'X-Tracking-Code': code }), ...extra,
+      }, body: new Uint8Array(body),
+    });
+  }
+  it('checks parent tracking authorization before storage or parsing', async () => {
+    vi.mocked(db.authorizeDocuments).mockRejectedValue(new HttpError(404, 'Request not found.'));
+    expect((await upload()).status).toBe(404);
+    expect(storage.requireStorage).not.toHaveBeenCalled();
+    expect(db.addDocument).not.toHaveBeenCalled();
+  });
+  it('requires the tracking secret outside the URL and validates the origin', async () => {
+    expect((await upload(false, bytes, { 'X-Tracking-Code': '' })).status).toBe(400);
+    expect((await upload(false, bytes, { Origin: 'https://evil.example.test' })).status).toBe(403);
+    expect(db.addDocument).not.toHaveBeenCalled();
+  });
+  it('preserves bytes for parent upload and omits code/metadata from its response', async () => {
+    const response = await upload();
+    expect(response.status).toBe(201);
+    expect(await response.json()).toEqual({ ok: true });
+    expect(db.authorizeDocuments).toHaveBeenCalledWith({ code });
+    const args = vi.mocked(db.addDocument).mock.calls[0];
+    expect(args.slice(0, 3)).toEqual([4, { filename: 'original.pdf', mimeType: 'application/pdf', size: bytes.length }, null]);
+    await args[3]('private-key');
+    expect(storage.uploadBlob).toHaveBeenCalledWith('private-key', bytes, 'application/pdf');
+  });
+  it('requires current central staff roles for upload, list and download', async () => {
+    expect((await call('/api/staff/requests/4/documents')).status).toBe(401);
+    fixtures.user.roles = ['Parent'];
+    expect((await upload(true)).status).toBe(403);
+    expect((await call(`/api/staff/requests/4/documents/${documentId}/download`, 'GET', undefined, true)).status).toBe(403);
+    expect(db.authorizeDocuments).not.toHaveBeenCalled();
+    fixtures.user.roles = ['Admissions Contributor'];
+    expect((await upload(true)).status).toBe(201);
+    expect(db.addDocument).toHaveBeenCalledWith(4, expect.anything(), 7, expect.any(Function), expect.any(Function));
+  });
+  it('enforces size/type limits and never accepts compressed uploads', async () => {
+    expect((await upload(false, Buffer.alloc(10 * 1024 * 1024 + 1))).status).toBe(413);
+    expect((await upload(false, Buffer.alloc(0))).status).toBe(413);
+    expect((await upload(false, Buffer.from('MZ executable'))).status).toBe(415);
+    expect((await upload(false, bytes, { 'Content-Encoding': 'gzip' })).status).toBe(415);
+    expect(db.addDocument).not.toHaveBeenCalled();
+  });
+  it('rejects a missing upload body explicitly without touching blob storage', async () => {
+    const response = await fetch(`${base}/api/tracking/documents`, {
+      method: 'POST', headers: {
+        'Content-Type': 'application/octet-stream', Origin: fixtures.config.PUBLIC_BASE_URL,
+        'X-Document-Name': 'file.pdf', 'X-Tracking-Code': code,
+      },
+    });
+    expect(response.status).toBe(413);
+    expect((await response.json()).error).toContain('non-empty');
+    expect(db.addDocument).not.toHaveBeenCalled();
+    expect(storage.uploadBlob).not.toHaveBeenCalled();
+  });
+  it('enforces the binary parser limit even without Content-Length', async () => {
+    const response = await fetch(`${base}/api/tracking/documents`, {
+      method: 'POST', headers: {
+        'Content-Type': 'application/octet-stream', Origin: fixtures.config.PUBLIC_BASE_URL,
+        'X-Document-Name': 'file.pdf', 'X-Tracking-Code': code,
+      },
+      body: Readable.from([Buffer.alloc(10 * 1024 * 1024 + 1)]) as unknown as BodyInit,
+      duplex: 'half',
+    } as RequestInit & { duplex: string });
+    expect(response.status).toBe(413);
+    expect(db.addDocument).not.toHaveBeenCalled();
+  });
+  it('accepts exactly 10,485,760 bytes and sanitizes download metadata filenames', async () => {
+    const boundary = Buffer.alloc(10 * 1024 * 1024); bytes.copy(boundary);
+    expect((await upload(false, boundary, { 'X-Document-Name': encodeURIComponent('../report\r\n.pdf') })).status).toBe(201);
+    expect(db.addDocument).toHaveBeenCalledWith(4,
+      { filename: '_report__.pdf', mimeType: 'application/pdf', size: 10485760 }, null, expect.any(Function), expect.any(Function));
+  });
+  it('reports the shared count limit without attempting another write', async () => {
+    vi.mocked(db.addDocument).mockRejectedValue(new HttpError(409, 'This enquiry already has 5 documents.'));
+    expect((await upload()).status).toBe(409);
+  });
+  it('rejects concurrent upload bodies instead of queuing them', async () => {
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => { release = resolve; });
+    let entered = 0;
+    vi.mocked(db.addDocument).mockImplementation(async () => { entered++; await blocked; });
+    const first = upload(), second = upload();
+    try {
+      await vi.waitFor(() => expect(entered).toBe(2));
+      expect((await upload()).status).toBe(503);
+    } finally { release(); await Promise.all([first, second]); }
+  });
+  it('keeps existing enquiries working when private storage is unconfigured', async () => {
+    vi.mocked(storage.storageReady).mockResolvedValue(false);
+    vi.mocked(storage.requireStorage).mockRejectedValue(new HttpError(503, 'Private document storage is unavailable.'));
+    expect((await upload()).status).toBe(503);
+    const list = await call('/api/tracking/documents/list', 'POST', { code });
+    expect(list.status).toBe(200);
+    expect(await list.json()).toMatchObject({ documents: [], ready: false, maxBytes: 10485760, maxCount: 5 });
+    expect((await call('/api/requests', 'POST', requestBody)).status).toBe(201);
+    expect(await (await call('/api/health')).json()).toMatchObject({ status: 'ok', documents: { ready: false } });
+    const configBody = await (await call('/api/config')).text();
+    expect(configBody).toContain('"ready":false');
+    expect(configBody).not.toContain('AZURE_STORAGE');
+  });
+  it.each([false, true])('scopes %s downloads to the authorized enquiry and sends private unchanged attachments', async (staff) => {
+    vi.mocked(db.getDocument).mockResolvedValue({
+      id: documentId, filename: 'original.pdf', mimeType: 'application/pdf', size: bytes.length,
+      createdAt: new Date().toISOString(), uploadedBy: 'parent', blobName: 'private-storage-key',
+    });
+    vi.mocked(storage.downloadBlob).mockResolvedValue(Readable.from([bytes]));
+    const response = await call(`${staff ? '/api/staff/requests/4/documents' : '/api/tracking/documents'}/${documentId}/download`,
+      staff ? 'GET' : 'POST', staff ? undefined : { code }, staff);
+    expect(response.status).toBe(200);
+    expect(response.headers.get('cache-control')).toBe('private, no-store');
+    expect(response.headers.get('content-disposition')).toMatch(/^attachment; filename="?original\.pdf"?$/);
+    expect(response.headers.get('x-content-type-options')).toBe('nosniff');
+    expect(response.headers.get('content-encoding')).toBeNull();
+    expect(Buffer.from(await response.arrayBuffer())).toEqual(bytes);
+    expect(db.getDocument).toHaveBeenCalledWith(4, documentId);
+    expect(response.headers.get('location')).toBeNull();
+  });
+  it('does not download a document belonging to a different enquiry', async () => {
+    vi.mocked(db.getDocument).mockRejectedValue(new HttpError(404, 'Document not found.'));
+    expect((await call(`/api/tracking/documents/${documentId}/download`, 'POST', { code })).status).toBe(404);
+    expect(storage.downloadBlob).not.toHaveBeenCalled();
+  });
+  it('returns 503 rather than a blob link when download storage is unavailable', async () => {
+    vi.mocked(db.getDocument).mockResolvedValue({
+      id: documentId, filename: 'file.pdf', mimeType: 'application/pdf', size: bytes.length,
+      createdAt: new Date().toISOString(), uploadedBy: 'parent', blobName: 'private-key',
+    });
+    vi.mocked(storage.downloadBlob).mockRejectedValue(new HttpError(503, 'Private document storage is unavailable.'));
+    const response = await call(`/api/tracking/documents/${documentId}/download`, 'POST', { code });
+    expect(response.status).toBe(503);
+    expect(response.headers.get('location')).toBeNull();
+    expect(await response.text()).not.toContain('private-key');
+  });
+  it.each([false, true])('handles a download stream failure safely (headers sent: %s)', async (afterHeaders) => {
+    vi.mocked(db.getDocument).mockResolvedValue({
+      id: documentId, filename: 'file.pdf', mimeType: 'application/pdf', size: bytes.length,
+      createdAt: new Date().toISOString(), uploadedBy: 'parent', blobName: 'private-key',
+    });
+    let started = false;
+    const stream = new Readable({
+      read() {
+        if (started) return;
+        started = true;
+        if (afterHeaders) this.push(bytes.subarray(0, 20));
+        setTimeout(() => this.destroy(new Error('private-stream-failure-secret')), afterHeaders ? 30 : 0);
+      },
+    });
+    vi.mocked(storage.downloadBlob).mockResolvedValue(stream);
+    await expect((async () => {
+      const response = await call(`/api/tracking/documents/${documentId}/download`, 'POST', { code });
+      await response.arrayBuffer();
+    })()).rejects.toThrow();
+    expect((await call('/api/health')).status).toBe(200);
+    expect(stream.destroyed).toBe(true);
+  });
 });
 describe('anonymous request flow', () => {
   it('creates a cryptographically random tracking secret and does not expose the database id', async () => {

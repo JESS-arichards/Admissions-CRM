@@ -3,6 +3,7 @@ import { Link, useParams } from 'react-router';
 import { canAdminister, STAGES, type CentralUser, type Page, type RequestDetail, type RequestSummary } from '../../shared/contracts';
 import { api, errorMessage } from './api';
 import { Alert } from './App';
+import { Documents } from './Documents';
 
 export function Pipeline({ user }: { user: CentralUser }) {
   const [result, setResult] = useState<{ items: RequestSummary[]; hasMore: boolean } | null>(null);
@@ -108,6 +109,7 @@ export function RequestEditor({ user }: { user: CentralUser }) {
           </form>{saved && <p role="status">Update saved.</p>}
         </section>
       </div>
+      <Documents key={detail.id} requestId={detail.id} />
       <section className="panel"><h2>Activity history</h2><ol className="timeline">{detail.events.map((entry) => <li key={entry.id}>
         <div className="section-heading"><strong>{entry.actorName}</strong><time dateTime={entry.createdAt}>{new Date(entry.createdAt).toLocaleString()}</time></div>
         <span className="badge">{entry.stage}</span>

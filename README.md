@@ -22,9 +22,13 @@ implementation, not a HubSpot integration or reproduction of its proprietary UI.
   plain text, not executable HTML. Privacy cannot be unpublished.
 - Optimistic revisions prevent staff from overwriting concurrent request/page changes.
 
-Formal admissions applications, document uploads, child records, fee payments,
+Formal admissions applications, child records, fee payments,
 automated visit bookings, parent reply threads and HubSpot synchronisation are
 **not** included. A visit request is not a booking and an enquiry is not an application.
+
+Parents can upload, list and download enquiry documents **after looking up their
+private tracking code**. Authenticated Admissions staff can do the same on request
+details. All documents, including staff uploads, are visible to the code holder.
 
 ## Architecture and shared services
 
@@ -36,6 +40,7 @@ automated visit bookings, parent reply threads and HubSpot synchronisation are
 | Staff identity | Portal `/api/platform/v1`, Microsoft Entra ID and independent signed session cookie |
 | Brand | Same-origin proxy of Portal `/api/branding` and branding assets |
 | Email | Microsoft Graph application `Mail.Send`, durable SQL outbox |
+| Documents | Private Azure Blob Storage; references and metadata in Admissions SQL |
 
 The Applications Portal is the **only user directory and role authority**.
 There are no local accounts, duplicate passwords or local role grants.
@@ -107,6 +112,8 @@ There is no fake-data mode or silent email-to-console fallback.
 | `SQL_USER`, `SQL_PASSWORD` | Required for discrete SQL authentication |
 | `SQL_ENCRYPT` | `true` by default |
 | `SQL_TRUST_SERVER_CERTIFICATE` | `false` by default; use only for local development if needed |
+| `AZURE_STORAGE_CONNECTION_STRING` | Server-only HTTPS account-key connection string (no SAS/emulator); enables documents |
+| `AZURE_STORAGE_CONTAINER` | Private, pre-created container; default `admissions-files` |
 | `GRAPH_CLIENT_SECRET`, `MAIL_FROM_ADDRESS` | Configure both to enable email; leave both unset to disable opt-in. The app needs Graph application `Mail.Send` with admin consent |
 | `GRAPH_TENANT_ID`, `GRAPH_CLIENT_ID` | Optional overrides for the mail app registration; default to `ENTRA_TENANT_ID` / `ENTRA_CLIENT_ID` (same as the Applications Portal) |
 | `TRUST_PROXY_HOPS` | `0` locally; set the exact trusted hop count for hosting (usually `1` on App Service) |
@@ -119,6 +126,66 @@ Keep all credentials in server environment settings / Key Vault, never Vite vari
 Use independent credentials, databases and registrations/configuration per environment.
 Use HTTPS for all production traffic. A production cookie is Secure, HttpOnly and
 SameSite=Strict, scoped to Admissions with its own name and eight-hour lifetime.
+
+### Private enquiry documents
+
+Provision an Azure Storage account with **Allow Blob anonymous access disabled**,
+and a container with **Public access level: Private**. The application refuses
+document operations if the container reports anonymous access; it never creates
+public containers or issues SAS/download URLs.
+Set only `AZURE_STORAGE_CONNECTION_STRING` and `AZURE_STORAGE_CONTAINER`, matching the Portal naming;
+prefer a separate Admissions container/account and matching-environment settings.
+Never use Vite variables for credentials. Connection strings are server-only.
+
+Startup migrates existing Admissions databases to version 2 without replacing
+data. Alternatively run rerunnable `database\schema.sql` for new/existing databases,
+or `database\002-documents.sql` for an existing version-1 database. Back up first;
+the migration identity needs table/index creation permissions. No Portal database
+or role changes are required.
+
+Limits are **5 documents total per enquiry** (parent and staff combined), **10 MiB
+(10,485,760 bytes) per file**. This intentionally bounded first release has no delete
+or replace UI; contact Admissions if the limit is reached. Allowed types: PDF, DOCX,
+XLSX, PPTX, PNG, JPG/JPEG, WEBP and GIF. Clients check size/extension; the server checks
+signatures or Office ZIP structure/content types and rejects macros, embedded
+executables/OLE objects, encrypted Office archives and ZIP bombs. Office archives
+are limited to 2,048 entries, 100 MiB declared expanded content and a 64 KiB content
+types manifest. This is validation, **not malware scanning**; deploy an appropriate
+malware scanning/quarantine policy before handling untrusted documents at scale.
+
+Original bytes are stored and downloaded unchanged: no conversion, image
+re-encoding or document/HTTP compression. Metadata is separate in SQL; blob names
+are server-generated. Uploads are raw binary, one file at a time, with the tracking
+secret in a header (or existing staff cookie), never a URL. Parent list/download
+requests carry the tracking code in JSON. Origin checks and live central staff-role
+checks remain mandatory. Downloads are proxied attachments with safe filenames,
+`private, no-store` and `nosniff`, never public blob links. Configure reverse proxies
+and diagnostics not to log request bodies, cookies, or `X-Tracking-Code`.
+
+Per server process, each parent/staff document router permits two uploads and eight
+streaming downloads concurrently (four uploads/sixteen downloads combined), rejects
+excess work rather than queuing bodies, caps upload bodies and applies a 30-second
+upload inactivity timeout and document rate limits. SQL serializable enquiry locks
+enforce the shared five-file count across instances. On known SQL insert failure,
+the newly uploaded blob is deleted. An uncertain commit acknowledgement or lost
+storage acknowledgement may leave a private orphan; reconcile SQL references
+against blobs operationally, and monitor cleanup failures. Do not delete a blob
+automatically after an ambiguous commit, which could have succeeded.
+
+`/api/config` and `/api/health` include non-secret document readiness. Readiness checks
+the configured container exists, is private and is accessible for metadata reads;
+it does not guarantee write permission. Missing/inaccessible storage returns **503**
+for upload/download but does not prevent existing enquiries, tracking, staff work,
+or document metadata listings. No local-disk fallback is provided. Publish approved
+privacy/retention information covering documents; existing privacy page content is
+preserved by migration, so review it before enabling uploads.
+
+Storage initialization/operation failures and public-container rejection are logged
+through the server logger. Diagnostics contain only fixed operation/reason names,
+numeric HTTP status and allowlisted error codes/types—not Azure exception messages,
+stacks, request objects, storage URLs, connection strings or tracking secrets.
+Missing storage configuration produces a startup warning; normal enquiries remain
+available. Keep warning/error logs enabled when diagnosing storage permissions.
 
 ### Consistent identity and mail settings across applications
 
@@ -211,7 +278,7 @@ lacks DDL rights), run [database/schema.sql](database/schema.sql) against the
 **Admissions** database with SSMS, the Azure SQL query editor or
 `sqlcmd -S <server> -d <admissions-db> -G -b -i database\schema.sql`. It only creates
 missing tables, indexes and starter pages, never replaces existing data, and is safe
-to rerun. It records schema version 1, so startup skips its own migration afterwards.
+to rerun. It records schema versions 1 and 2; startup preserves existing tables/data.
 The central Admissions roles live in the Portal database and are created by the
 Portal's own `database/schema.sql` (migration v22).
 
@@ -225,11 +292,15 @@ Staff must allow the Microsoft sign-in popup.
 - Publish school-approved admissions, visits and privacy text. Replace the starter
   privacy notice with actual school controller/contact, purposes, legal basis,
   retention and rights information. Establish retention/deletion procedures for
-  requests, audit history, queued mail and backups; no automatic purge is provided.
+  requests, documents/blobs, audit history, queued mail and backups; no automatic purge is provided.
 - Verify Portal brand assets and colours, and configure official contact details in
   the information pages. Avoid sensitive personal details in parent-facing updates.
-- Check `/api/health` (SQL readiness), `/api/config`, `/api/branding`, brand assets
-  and the dedicated callback URL. Health checks do not exercise Portal or Graph.
+- Check `/api/health` (SQL and separate document readiness), `/api/config`,
+  `/api/branding`, brand assets and the dedicated callback URL. A healthy database
+  alone does not prove storage readiness. Health checks do not exercise Portal or Graph.
+- If documents are enabled, verify parent/staff upload/list/download against real
+  Azure Storage, role revocation, the sixth-file rejection and exact byte equality
+  after download. Confirm anonymous blob access fails and no secret appears in URLs/logs.
 - Sign in as Full Admin, Admissions Admin and Contributor; confirm role limits.
   Remove a role or disable a user centrally and confirm the next protected request
   fails. Check central outage behaviour.
@@ -245,8 +316,9 @@ Staff must allow the Microsoft sign-in popup.
 Public creation, tracking, sign-in and email actions are rate-limited. Limits are
 in-process; for multiple App Service instances enforce aggregate limits and bot
 protection at your trusted ingress/WAF. Set `TRUST_PROXY_HOPS` correctly so public
-clients cannot spoof forwarded IPs. All mutation requests require JSON and an
-Origin header exactly matching `PUBLIC_BASE_URL`; there is no cross-origin API.
+clients cannot spoof forwarded IPs. All mutation requests require JSON (except raw
+`application/octet-stream` document uploads) and an Origin header exactly matching
+`PUBLIC_BASE_URL`; there is no cross-origin API.
 No tracking code is put into a query string, cookie or local storage.
 
 ## Validation
@@ -256,5 +328,5 @@ public validation, session cookies, consent endpoints, one-time confirmation che
 outbox eligibility/retries, concurrency and explicit public response projections,
 plus shared navigation/brand colour tests. SQL unit tests mock the driver; API tests
 use real local HTTP with mocked central/data services. They do **not** replace live
-Azure SQL, Entra and Graph smoke tests. Browser checks with mocked APIs can validate
+Azure SQL, Blob Storage, Entra and Graph smoke tests. Browser checks with mocked APIs can validate
 UI flows but are not proof of external service integration.

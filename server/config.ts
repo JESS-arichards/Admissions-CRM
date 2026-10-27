@@ -26,6 +26,18 @@ const env = z.object({
   SQL_USER: optional,
   SQL_PASSWORD: optional,
   SQL_MANAGED_IDENTITY_CLIENT_ID: optional,
+  AZURE_STORAGE_CONNECTION_STRING: optional.pipe(z.string().refine((value) => {
+    if (/SharedAccessSignature|UseDevelopmentStorage/i.test(value) || !/(?:^|;)AccountKey=[^;]+/i.test(value)) return false;
+    if (/(?:^|;)DefaultEndpointsProtocol=/i.test(value) && !/(?:^|;)DefaultEndpointsProtocol=https(?:;|$)/i.test(value)) return false;
+    for (const match of value.matchAll(/(?:^|;)\w*Endpoint=([^;]+)/gi)) {
+      try {
+        const url = new URL(match[1]);
+        if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash || url.pathname !== '/') return false;
+      } catch { return false; }
+    }
+    return true;
+  }, 'Use an HTTPS Azure account-key connection string, not SAS or development storage.').optional()),
+  AZURE_STORAGE_CONTAINER: z.string().regex(/^[a-z0-9](?:[a-z0-9-]{1,61}[a-z0-9])$/).default('admissions-files'),
   SQL_ENCRYPT: bool(true),
   SQL_TRUST_SERVER_CERTIFICATE: bool(false),
   GRAPH_TENANT_ID: optional.pipe(z.uuid().optional()),

@@ -13,6 +13,9 @@ import * as db from './db.js';
 import { HttpError, logger } from './errors.js';
 import { centralSession, getBrand, portalFetch } from './platform.js';
 import { newSecret } from './secrets.js';
+import { documentRouter, isDocumentUpload } from './documents.js';
+import { storageReady } from './documentStorage.js';
+import { DOCUMENT_MAX_BYTES, DOCUMENT_MAX_COUNT } from '../shared/contracts.js';
 
 export function createApp() {
   const app = express();
@@ -29,13 +32,13 @@ export function createApp() {
     referrerPolicy: { policy: 'no-referrer' },
     crossOriginOpenerPolicy: { policy: 'same-origin-allow-popups' },
   }));
-  app.use(compression());
+  app.use(compression({ filter: (req, res) => !req.originalUrl.includes('/documents') && compression.filter(req, res) }));
   app.use('/api', (_req, res, next) => { res.setHeader('Cache-Control', 'no-store'); next(); });
   app.use('/api', (req, _res, next) => {
     if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
       const origin = req.get('origin');
       if (origin !== config.PUBLIC_BASE_URL) throw new HttpError(403, 'Request origin is not permitted.');
-      if (!req.is('application/json')) throw new HttpError(415, 'Use application/json.');
+      if (!req.is('application/json') && !(isDocumentUpload(req) && req.is('application/octet-stream'))) throw new HttpError(415, 'Use application/json (or application/octet-stream for document uploads).');
     }
     next();
   });
@@ -48,12 +51,13 @@ export function createApp() {
   const lookupLimit = limit(40, 15);
   app.get('/api/health', async (_req, res) => {
     await db.pool.request().query('SELECT 1');
-    res.json({ status: 'ok' });
+    res.json({ status: 'ok', documents: { ready: await storageReady() } });
   });
-  app.get('/api/config', (_req, res) => res.json({
+  app.get('/api/config', async (_req, res) => res.json({
     entra: { enabled: true, clientId: config.ENTRA_CLIENT_ID, authority: `https://login.microsoftonline.com/${config.ENTRA_TENANT_ID}` },
     profileUrl: `${config.APPLICATIONS_PORTAL_URL}/profile`,
     emailEnabled: config.emailEnabled,
+    documents: { ready: await storageReady(), maxBytes: DOCUMENT_MAX_BYTES, maxCount: DOCUMENT_MAX_COUNT },
   }));
   app.get('/api/branding', async (_req, res) => res.json(await getBrand()));
   app.get('/api/branding/assets/:asset', async (req, res) => {
@@ -77,6 +81,7 @@ export function createApp() {
     const { code } = trackingSchema.parse(req.body);
     res.json(await db.getProgress(code));
   });
+  app.use('/api/tracking/documents', limit(60, 15), documentRouter(false));
   app.post('/api/tracking/notifications', lookupLimit, async (req, res) => {
     const { code, enabled } = trackingSchema.extend({ enabled: z.boolean() }).parse(req.body);
     if (enabled && !config.emailEnabled) throw new HttpError(503, 'Email updates are not configured.');
@@ -101,6 +106,7 @@ export function createApp() {
   });
   app.get('/api/auth/me', authenticated, (req, res) => res.json(req.user));
   app.use('/api/staff', authenticated);
+  app.use('/api/staff/requests/:id/documents', limit(60, 15), documentRouter(true));
   app.get('/api/staff/requests', async (req, res) => {
     const query = z.object({
       q: z.string().trim().max(120).default(''),
@@ -130,6 +136,7 @@ export function createApp() {
     res.sendFile(path.join(clientDir, 'index.html'));
   });
   const errors: ErrorRequestHandler = (error: unknown, _req, res, _next) => {
+    if (res.headersSent || res.destroyed) { res.destroy(); return; }
     if (error instanceof z.ZodError) {
       res.status(400).json({ error: 'Please check the submitted fields.', code: 'VALIDATION_ERROR',
         fields: error.issues.map((issue) => ({ field: issue.path.join('.'), message: issue.message })) });

@@ -1,4 +1,6 @@
 import sql from 'mssql';
+import { randomUUID } from 'node:crypto';
+import { DOCUMENT_MAX_COUNT, type EnquiryDocument } from '../shared/contracts.js';
 import type { CentralUser, NewRequest, Page, Progress, RequestDetail, RequestSummary, RequestUpdate, StaffEvent } from '../shared/contracts.js';
 import { config } from './config.js';
 import { HttpError, logger } from './errors.js';
@@ -117,6 +119,23 @@ export async function migrate() {
           ('privacy',N'Privacy and your enquiry',N'We collect the contact details and enquiry you provide so our admissions team can respond. Do not include sensitive information or documents about your child in this form. Keep your tracking code private: anyone with the code can see the progress and public updates for your request. Email updates are optional and require confirmation of your email address. You can turn them off on the tracking page. Contact the admissions team for privacy enquiries. The school must publish its approved retention policy, contact details and privacy information here before launch.');
         INSERT dbo.AdmissionsSchema(version) VALUES(1);
       END
+      IF OBJECT_ID(N'dbo.AdmissionsDocuments', N'U') IS NULL
+      BEGIN
+        CREATE TABLE dbo.AdmissionsDocuments (
+          id uniqueidentifier NOT NULL PRIMARY KEY,
+          requestId int NOT NULL REFERENCES dbo.AdmissionsRequests(id),
+          blobName varchar(100) NOT NULL UNIQUE,
+          filename nvarchar(180) NOT NULL,
+          mimeType varchar(100) NOT NULL,
+          size int NOT NULL CHECK (size>0 AND size<=10485760),
+          uploadedBy varchar(6) NOT NULL CHECK (uploadedBy IN ('parent','staff')),
+          actorId int NULL,
+          createdAt datetime2 NOT NULL DEFAULT SYSUTCDATETIME()
+        );
+        CREATE INDEX IX_AdmissionsDocuments_request ON dbo.AdmissionsDocuments(requestId, createdAt);
+      END;
+      IF NOT EXISTS (SELECT 1 FROM dbo.AdmissionsSchema WHERE version=2)
+        INSERT dbo.AdmissionsSchema(version) VALUES(2);
     `);
   });
 }
@@ -128,6 +147,69 @@ const event = (row: DbEvent): StaffEvent => ({ ...row, createdAt: row.createdAt.
 const summaryColumns = 'id,kind,parentName,email,yearGroup,stage,ownerId,ownerName,createdAt,updatedAt,revision';
 const missing = () => new HttpError(404, 'Request not found.', 'NOT_FOUND');
 const conflict = () => new HttpError(409, 'This record has changed. Reload it before saving.', 'REVISION_CONFLICT');
+
+export type DocumentAccess = { code: string } | { requestId: number };
+function documentAccess(request: sql.Request, access: DocumentAccess) {
+  return 'code' in access
+    ? request.input('codeHash', sql.Char(64), hashSecret(access.code))
+    : request.input('requestId', sql.Int, access.requestId);
+}
+const accessWhere = (access: DocumentAccess) => 'code' in access ? 'codeHash=@codeHash' : 'id=@requestId';
+export async function authorizeDocuments(access: DocumentAccess): Promise<number> {
+  const result = await documentAccess(pool.request(), access).query(`SELECT id FROM dbo.AdmissionsRequests WHERE ${accessWhere(access)}`);
+  if (!result.recordset[0]) throw missing();
+  return result.recordset[0].id;
+}
+type StoredDocument = EnquiryDocument & { blobName: string };
+const documentColumns = 'id,filename,mimeType,size,uploadedBy,createdAt';
+function documentRow(row: Omit<EnquiryDocument, 'createdAt'> & { createdAt: Date }): EnquiryDocument {
+  return { id: row.id, filename: row.filename, mimeType: row.mimeType, size: row.size,
+    uploadedBy: row.uploadedBy, createdAt: row.createdAt.toISOString() };
+}
+export async function listDocuments(requestId: number): Promise<EnquiryDocument[]> {
+  const result = await pool.request().input('requestId', sql.Int, requestId)
+    .query(`SELECT ${documentColumns} FROM dbo.AdmissionsDocuments WHERE requestId=@requestId ORDER BY createdAt,id`);
+  return result.recordset.map(documentRow);
+}
+export async function getDocument(requestId: number, id: string): Promise<StoredDocument> {
+  const result = await pool.request().input('requestId', sql.Int, requestId).input('id', sql.UniqueIdentifier, id)
+    .query(`SELECT ${documentColumns},blobName FROM dbo.AdmissionsDocuments WHERE requestId=@requestId AND id=@id`);
+  if (!result.recordset[0]) throw new HttpError(404, 'Document not found.');
+  return { ...documentRow(result.recordset[0]), blobName: result.recordset[0].blobName };
+}
+export async function addDocument(requestId: number, metadata: { filename: string; mimeType: string; size: number },
+  actorId: number | null, upload: (name: string) => Promise<void>, cleanup: (name: string) => Promise<void>): Promise<void> {
+  const id = randomUUID();
+  const blobName = `enquiries/${requestId}/${id}`;
+  let uploaded = false, commitAttempted = false;
+  try {
+    await transaction(async (tx) => {
+      // Lock the enquiry, not just current document rows, so a previously empty set is also safe across instances.
+      const parent = await new sql.Request(tx).input('id', sql.Int, requestId)
+        .query('SELECT id FROM dbo.AdmissionsRequests WITH (UPDLOCK,HOLDLOCK) WHERE id=@id');
+      if (!parent.recordset[0]) throw missing();
+      const count = await new sql.Request(tx).input('requestId', sql.Int, requestId)
+        .query('SELECT COUNT(*) AS count FROM dbo.AdmissionsDocuments WHERE requestId=@requestId');
+      if (count.recordset[0].count >= DOCUMENT_MAX_COUNT) throw new HttpError(409, 'This enquiry already has 5 documents. Contact Admissions for help.');
+      await upload(blobName); uploaded = true;
+      await new sql.Request(tx).input('id', sql.UniqueIdentifier, id).input('requestId', sql.Int, requestId)
+        .input('blobName', sql.VarChar(100), blobName).input('filename', sql.NVarChar(180), metadata.filename)
+        .input('mimeType', sql.VarChar(100), metadata.mimeType).input('size', sql.Int, metadata.size)
+        .input('uploadedBy', sql.VarChar(6), actorId === null ? 'parent' : 'staff').input('actorId', sql.Int, actorId)
+        .query(`INSERT dbo.AdmissionsDocuments(id,requestId,blobName,filename,mimeType,size,uploadedBy,actorId)
+          VALUES(@id,@requestId,@blobName,@filename,@mimeType,@size,@uploadedBy,@actorId)`);
+      commitAttempted = true;
+    });
+  } catch (error) {
+    if (uploaded && !commitAttempted) {
+      try { await cleanup(blobName); } catch { logger.error('Document cleanup failed; private orphan reconciliation required.'); }
+    } else if (uploaded) {
+      // A lost COMMIT acknowledgement is ambiguous: deleting here could destroy a committed document.
+      logger.error('Document commit outcome uncertain; private orphan reconciliation may be required.');
+    }
+    throw error;
+  }
+}
 
 export async function createRequest(data: NewRequest, code: string, verificationToken: string | null) {
   return transaction(async (tx) => {

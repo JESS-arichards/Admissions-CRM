@@ -24,7 +24,7 @@ vi.mock('mssql', () => {
   class ConnectionPool { on() {} request() { return new Request(); } }
   return { default: {
     ConnectionPool, Request, Transaction, ISOLATION_LEVEL: { SERIALIZABLE: 4 },
-    Char: vi.fn(), VarChar: vi.fn(), NVarChar: vi.fn((length: number | string) => {
+    UniqueIdentifier: 'uuid', Char: vi.fn(), VarChar: vi.fn(), NVarChar: vi.fn((length: number | string) => {
       if (typeof length === 'number' && length > 4000) throw new Error('SQL Server nvarchar length exceeds 4000.');
       return { length };
     }), Int: 'int', Bit: 'bit', MAX: 'max',
@@ -65,6 +65,60 @@ describe('persisted request privacy', () => {
     expect(state.calls[0].inputs.notifications).toBe('pending');
     expect(state.calls.at(-1)?.inputs).toMatchObject({ id: 4, kind: 'confirmation', token: 'b'.repeat(32) });
     expect(state.commit).toHaveBeenCalledOnce();
+  });
+  describe('document persistence and cross-instance limits', () => {
+    const metadata = { filename: 'file.pdf', mimeType: 'application/pdf', size: 40 };
+    it('locks an enquiry across count, upload and metadata insertion', async () => {
+      state.results.push({ recordset: [{ id: 4 }] }, { recordset: [{ count: 4 }] });
+      const upload = vi.fn(), cleanup = vi.fn();
+      await db.addDocument(4, metadata, 7, upload, cleanup);
+      expect(state.calls[0].query).toContain('WITH (UPDLOCK,HOLDLOCK)');
+      expect(state.calls[1].query).toContain('COUNT(*)');
+      expect(state.calls[2].inputs).toMatchObject({ requestId: 4, ...metadata, actorId: 7, uploadedBy: 'staff' });
+      expect(upload).toHaveBeenCalledWith(expect.stringMatching(/^enquiries\/4\/[a-f0-9-]+$/));
+      expect(cleanup).not.toHaveBeenCalled();
+      expect(state.commit).toHaveBeenCalledOnce();
+    });
+    it('rejects the sixth document before blob upload, including parent/staff combined', async () => {
+      state.results.push({ recordset: [{ id: 4 }] }, { recordset: [{ count: 5 }] });
+      const upload = vi.fn(), cleanup = vi.fn();
+      await expect(db.addDocument(4, metadata, null, upload, cleanup)).rejects.toMatchObject({ status: 409 });
+      expect(upload).not.toHaveBeenCalled(); expect(cleanup).not.toHaveBeenCalled();
+      expect(state.rollback).toHaveBeenCalledOnce();
+    });
+    it('cleans up the uploaded blob after a known insert failure', async () => {
+      state.results.push({ recordset: [{ id: 4 }] }, { recordset: [{ count: 0 }] });
+      const upload = vi.fn(), cleanup = vi.fn();
+      // The metadata binding fails before INSERT, after the successful upload.
+      vi.mocked(sql.NVarChar).mockImplementationOnce(() => { throw new Error('known database failure'); });
+      await expect(db.addDocument(4, metadata, null, upload, cleanup)).rejects.toThrow('known database failure');
+      expect(cleanup).toHaveBeenCalledWith(upload.mock.calls[0][0]);
+      expect(state.rollback).toHaveBeenCalledOnce();
+    });
+    it('does not destroy a blob after an ambiguous commit acknowledgement', async () => {
+      state.results.push({ recordset: [{ id: 4 }] }, { recordset: [{ count: 0 }] });
+      state.commit.mockRejectedValueOnce(new Error('acknowledgement lost'));
+      const upload = vi.fn(), cleanup = vi.fn();
+      await expect(db.addDocument(4, metadata, null, upload, cleanup)).rejects.toThrow('acknowledgement lost');
+      expect(upload).toHaveBeenCalledOnce(); expect(cleanup).not.toHaveBeenCalled();
+    });
+    it('authorizes code digests and scopes document queries to an enquiry', async () => {
+      state.results.push({ recordset: [{ id: 4 }] }, { recordset: [] });
+      expect(await db.authorizeDocuments({ code: 'd'.repeat(32) })).toBe(4);
+      expect(state.calls[0].inputs.codeHash).toBe(hashSecret('d'.repeat(32)));
+      await expect(db.getDocument(4, '11111111-1111-4111-8111-111111111111')).rejects.toMatchObject({ status: 404 });
+      expect(state.calls[1].query).toContain('WHERE requestId=@requestId AND id=@id');
+    });
+    it('does not expose blob references in metadata lists', async () => {
+      state.results.push({ recordset: [{
+        id: 'uuid', filename: 'file.pdf', mimeType: 'application/pdf', size: 40, uploadedBy: 'parent',
+        createdAt: new Date(), blobName: 'private-key', actorId: 7,
+      }] });
+      const documents = await db.listDocuments(4);
+      expect(documents[0]).not.toHaveProperty('blobName');
+      expect(documents[0]).not.toHaveProperty('actorId');
+      expect(state.calls[0].query).not.toContain('blobName');
+    });
   });
   it('projects public progress explicitly, never contact details or internal notes', async () => {
     const now = new Date();

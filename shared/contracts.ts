@@ -1,5 +1,24 @@
 import { z } from 'zod';
 
+export const DOCUMENT_MAX_BYTES = 10 * 1024 * 1024;
+export const DOCUMENT_MAX_COUNT = 5;
+export const DOCUMENT_TYPES = {
+  pdf: 'application/pdf',
+  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg',
+  webp: 'image/webp', gif: 'image/gif',
+} as const;
+export interface EnquiryDocument {
+  id: string;
+  filename: string;
+  mimeType: string;
+  size: number;
+  createdAt: string;
+  uploadedBy: 'parent' | 'staff';
+}
+
 export const STAGES = ['New', 'In progress', 'Awaiting parent', 'Visit arranged', 'Resolved', 'Closed'] as const;
 export const KINDS = ['Enquiry', 'Visit request'] as const;
 export const centralUserSchema = z.object({
@@ -104,4 +123,5 @@ export interface PublicConfig {
   entra: { clientId: string; authority: string; enabled: boolean };
   profileUrl: string;
   emailEnabled: boolean;
+  documents?: { ready: boolean; maxBytes: number; maxCount: number };
 }
