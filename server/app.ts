@@ -16,8 +16,10 @@ import { newSecret } from './secrets.js';
 import { documentRouter, isDocumentUpload } from './documents.js';
 import { storageReady } from './documentStorage.js';
 import { DOCUMENT_MAX_BYTES, DOCUMENT_MAX_COUNT } from '../shared/contracts.js';
+import { processMailBatch } from './mail.js';
+import { isTransientSqlError } from './sqlServerless.js';
 
-export function createApp() {
+export function createApp(isReady: () => boolean = () => true) {
   const app = express();
   app.disable('x-powered-by');
   app.set('trust proxy', config.TRUST_PROXY_HOPS);
@@ -34,6 +36,15 @@ export function createApp() {
   }));
   app.use(compression({ filter: (req, res) => !req.originalUrl.includes('/documents') && compression.filter(req, res) }));
   app.use('/api', (_req, res, next) => { res.setHeader('Cache-Control', 'no-store'); next(); });
+  app.get('/api/live', (_req, res) => res.json({ status: 'ok' }));
+  app.use('/api', (_req, res, next) => {
+    if (!isReady()) {
+      res.setHeader('Retry-After', '10');
+      res.status(503).json({ error: 'Admissions is initializing. Please try again shortly.', code: 'NOT_READY' });
+      return;
+    }
+    next();
+  });
   app.use('/api', (req, _res, next) => {
     if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
       const origin = req.get('origin');
@@ -105,6 +116,26 @@ export function createApp() {
     res.json({ ok: true });
   });
   app.get('/api/auth/me', authenticated, (req, res) => res.json(req.user));
+  app.post('/api/admin/background-jobs/run', authenticated, (req, _res, next) => {
+    if (!req.user!.roles.includes('Full Admin')) throw new HttpError(403, 'Central Full Admin permission is required.');
+    if (!config.SQL_SERVERLESS_ENABLED) throw new HttpError(404, 'Manual background processing is not enabled.');
+    next();
+  }, limit(6, 1), async (req, res) => {
+    const actorId = req.user!.id;
+    logger.info({ actorId, job: 'mail' }, 'Manual background processing started');
+    let result: Awaited<ReturnType<typeof processMailBatch>>;
+    try { result = await processMailBatch(); } catch (error) {
+      logger.warn({
+        actorId, job: 'mail', errorType: error instanceof Error ? error.name : 'Unknown',
+        ...(error instanceof HttpError ? { code: error.code, httpStatus: error.status } : {}),
+      }, 'Manual background processing did not complete');
+      throw error;
+    }
+    logger.info({ actorId, job: 'mail', ...result }, 'Manual background processing finished');
+    res.status(result.failed ? 502 : 200).json({
+      ...result, ...(result.failed ? { error: 'Some email deliveries failed; retry queued or exhausted.', code: 'MAIL_BATCH_FAILED' } : {}),
+    });
+  });
   app.use('/api/staff', authenticated);
   app.use('/api/staff/requests/:id/documents', limit(60, 15), documentRouter(true));
   app.get('/api/staff/requests', async (req, res) => {
@@ -137,12 +168,20 @@ export function createApp() {
   });
   const errors: ErrorRequestHandler = (error: unknown, _req, res, _next) => {
     if (res.headersSent || res.destroyed) { res.destroy(); return; }
+    if (config.SQL_SERVERLESS_ENABLED && isTransientSqlError(error)) {
+      res.setHeader('Retry-After', '10');
+      res.status(503).json({ error: 'The database is temporarily unavailable. Check the result before retrying a change.', code: 'SQL_UNAVAILABLE' });
+      return;
+    }
     if (error instanceof z.ZodError) {
       res.status(400).json({ error: 'Please check the submitted fields.', code: 'VALIDATION_ERROR',
         fields: error.issues.map((issue) => ({ field: issue.path.join('.'), message: issue.message })) });
       return;
     }
-    if (error instanceof HttpError) { res.status(error.status).json({ error: error.message, code: error.code }); return; }
+    if (error instanceof HttpError) {
+      if (error.status === 503) res.setHeader('Retry-After', '10');
+      res.status(error.status).json({ error: error.message, code: error.code }); return;
+    }
     if (error instanceof SyntaxError && 'status' in error && error.status === 400) {
       res.status(400).json({ error: 'Invalid JSON.', code: 'INVALID_JSON' }); return;
     }

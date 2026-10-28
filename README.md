@@ -93,7 +93,7 @@ npm run dev
 
 Browse `http://localhost:5174`. Vite proxies `/api` to port 8081.
 If using other ports, update Vite's proxy and `PUBLIC_BASE_URL` together.
-The server validates required configuration and migrates its database before listening.
+By default the server validates required configuration and migrates its database before listening.
 There is no fake-data mode or silent email-to-console fallback.
 
 ## Server configuration
@@ -112,6 +112,7 @@ There is no fake-data mode or silent email-to-console fallback.
 | `SQL_USER`, `SQL_PASSWORD` | Required for discrete SQL authentication |
 | `SQL_ENCRYPT` | `true` by default |
 | `SQL_TRUST_SERVER_CERTIFICATE` | `false` by default; use only for local development if needed |
+| `SQL_SERVERLESS_ENABLED` | Strict `true`/`false`, default `false`. Optional development Azure SQL serverless wake/manual-mail mode; leave unset or `false` in production |
 | `AZURE_STORAGE_CONNECTION_STRING` | Server-only HTTPS account-key connection string (no SAS/emulator); enables documents |
 | `AZURE_STORAGE_CONTAINER` | Private, pre-created container; default `admissions-files` |
 | `GRAPH_CLIENT_SECRET`, `MAIL_FROM_ADDRESS` | Configure both to enable email; leave both unset to disable opt-in. The app needs Graph application `Mail.Send` with admin consent |
@@ -126,6 +127,73 @@ Keep all credentials in server environment settings / Key Vault, never Vite vari
 Use independent credentials, databases and registrations/configuration per environment.
 Use HTTPS for all production traffic. A production cookie is Secure, HttpOnly and
 SameSite=Strict, scoped to Admissions with its own name and eight-hour lifetime.
+
+### Optional development SQL serverless auto-pause
+
+For a **development-only** Azure SQL serverless database, enable auto-pause in Azure.
+The `jess-admissions-dev` deployment workflow automatically sets
+`SQL_SERVERLESS_ENABLED=true` and the App Service Health check path `/api/live` on that
+app only, after Azure login and before deployment. You still configure the SQL
+connection settings below. For other development hosts, set the flag manually.
+This does not provision/change Azure SQL service tier or auto-pause delay. Use a fresh,
+separate development Admissions database; no data migration is needed. Production
+keeps normal startup and automatic mail polling: do not enable this flag there.
+
+Connection settings have this precedence: `SQL_CONNECTION_STRING`, then Azure App
+Service's `SQLAZURECONNSTR_DefaultConnection`, then `SQL_SERVER` / `SQL_DATABASE`
+with `SQL_AUTH`. Connection-string credentials/authentication take precedence over
+discrete `SQL_USER` / `SQL_PASSWORD` or managed-identity settings. For discrete SQL
+authentication set `SQL_AUTH=sql` with both credentials; otherwise use managed identity
+(and optionally `SQL_MANAGED_IDENTITY_CLIENT_ID`). Never put SQL credentials in client settings.
+
+Serverless mode enforces pool minimum zero and 30-second idle eviction, including
+connection-string configurations. It bounds startup connection attempts to ten seconds
+and retries known transient connection/wake failures (including Azure SQL 40613)
+with exponential backoff for approximately 90 seconds total. Authentication/configuration
+errors fail immediately. Migrations run once after connecting; migrations and application
+queries/writes are **never automatically replayed**, because a lost acknowledgement
+may mean a write already committed. Exhausted wake retries or migration failures fail
+startup; inspect logs and restart after correcting the cause.
+
+The HTTP listener starts before SQL initialization only in serverless mode.
+`GET /api/live` returns 200 without accessing SQL, storage, Portal or Graph. Dependent
+`/api` endpoints return **503** with **Retry-After: 10** until migrations finish.
+Use **`/api/live` as the development App Service Health check path**, and use it for
+uptime probes so they do not prevent SQL auto-pause. Do not monitor `/api/health`,
+`/api/config`, or other dependency-touching endpoints on a schedule in this mode:
+`/api/health` still deliberately queries SQL and checks document storage.
+Liveness is not a dependency readiness check. Other applications, SQL tools, open
+connections and monitoring can also prevent auto-pause.
+
+At runtime recognized transient SQL errors return 503 with Retry-After rather than
+logging staff out or deleting their session. Central Portal availability is still required
+for every protected operation; no cached-authority bypass is introduced. Before retrying
+a failed write, check whether it completed; the server does not retry it for you.
+
+**Development background processing is manual.** Serverless mode starts no mail
+polling timer. Requests still enqueue real messages in the durable SQL outbox.
+A signed-in, active **central Full Admin** (not Admissions Admin/Contributor) can run:
+
+```javascript
+// From the Admissions origin, using the existing signed-in session.
+await fetch('/api/admin/background-jobs/run', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: '{}',
+}).then(async response => ({ status: response.status, result: await response.json() }));
+```
+
+This same-origin, CSRF-protected endpoint is limited to six accepted runs per minute,
+is unavailable in normal mode, and rejects overlapping in-process batches with 409.
+Each run processes at most ten queued mail jobs using the configured Graph mailbox
+and returns `{ sent, failed }`. Delivery failures return 502 with counts, SQL resume
+errors return 503, and missing email configuration fails explicitly. No delivery or
+database errors are silently reported as success. Run again manually for remaining
+jobs or after their SQL outbox retry delay (up to eight attempts); expiring confirmation
+tokens and queue delays still apply. The outbox uses database leases across instances
+and remains at-least-once delivery: an ambiguous Graph response or a lost completion
+acknowledgement can lead to later duplicate delivery. This is not a scheduler or an
+exactly-once guarantee. With the flag off, the existing five-second mail worker continues.
 
 ### Private enquiry documents
 
@@ -252,11 +320,16 @@ Deploy the standalone repository to an Azure App Service running Node.js 24.
 Build with development dependencies available; deploy `dist`, `package.json`,
 `package-lock.json` and production dependencies. Start with `npm start`. Front end
 and API are hosted by the same Node service. Configure HTTPS-only, the correct port,
-**Always On** (the mail worker runs in-process), environment settings, SQL firewall/
+**Always On** (the normal-mode mail worker runs in-process), environment settings, SQL firewall/
 network access and database permissions. No sibling checkout is required at runtime.
 CI validates pull requests and pushes. The development deployment workflow validates,
 builds and deploys pushes to `development` to the existing `jess-admissions-dev`
-App Service, then checks `/api/health`. It uses the repository's Azure OIDC secrets
+App Service. Before deployment it enables development-only `SQL_SERVERLESS_ENABLED=true`
+and Health check path `/api/live` on that app, failing explicitly if it cannot find
+exactly one app or lacks permission; setting values are not printed. After deployment
+it checks `/api/live`, then deliberately checks `/api/health` (which wakes SQL).
+It does not change the legacy workflow, other apps, database names or credentials.
+It uses the repository's Azure OIDC secrets
 and does not provision resources or set application credentials. The older
 `admissions-crm` deployment workflow is manual-only so development pushes do not
 deploy to a second app.

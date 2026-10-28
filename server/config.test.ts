@@ -19,11 +19,25 @@ async function load(env: Record<string, string>) {
   vi.resetModules();
   for (const key of [...graphKeys, 'AZURE_STORAGE_CONNECTION_STRING']) vi.stubEnv(key, '');
   vi.stubEnv('AZURE_STORAGE_CONTAINER', undefined);
+  vi.stubEnv('SQL_SERVERLESS_ENABLED', undefined);
   for (const [key, value] of Object.entries({ ...base, ...env })) vi.stubEnv(key, value);
   return (await import('./config.js')).config;
 }
 
 afterEach(() => { vi.unstubAllEnvs(); });
+
+describe('optional SQL serverless configuration', () => {
+  it('defaults off, including production', async () => {
+    expect((await load({})).SQL_SERVERLESS_ENABLED).toBe(false);
+    expect((await load({ NODE_ENV: 'production' })).SQL_SERVERLESS_ENABLED).toBe(false);
+  });
+  it.each(['true', 'false'])('accepts explicit %s', async (value) => {
+    expect((await load({ SQL_SERVERLESS_ENABLED: value })).SQL_SERVERLESS_ENABLED).toBe(value === 'true');
+  });
+  it.each(['1', 'yes', 'TRUE', ''])('rejects invalid boolean %j', async (value) => {
+    await expect(load({ SQL_SERVERLESS_ENABLED: value })).rejects.toThrow();
+  });
+});
 
 describe('Graph email configuration', () => {
   it('defaults the Graph tenant and client to the Entra app registration', async () => {

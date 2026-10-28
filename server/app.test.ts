@@ -11,7 +11,7 @@ const fixtures = vi.hoisted(() => ({
     NODE_ENV: 'test', PUBLIC_BASE_URL: 'http://localhost:5174', APPLICATIONS_PORTAL_URL: 'https://portal.example.test',
     ENTRA_CLIENT_ID: '11111111-1111-4111-8111-111111111111', ENTRA_TENANT_ID: '22222222-2222-4222-8222-222222222222',
     SESSION_SECRET: 'test-only-independent-session-secret-123456', PLATFORM_API_KEY: 'test-only-platform-key-123456789012345678',
-    TRUST_PROXY_HOPS: 0, emailEnabled: true, LOG_LEVEL: 'silent',
+    TRUST_PROXY_HOPS: 0, emailEnabled: true, LOG_LEVEL: 'silent', SQL_SERVERLESS_ENABLED: false,
   },
   user: {
     id: 7, email: 'staff@example.test', displayName: 'Admissions Staff', isActive: true, sessionVersion: 3,
@@ -31,12 +31,14 @@ vi.mock('./documentStorage.js', () => ({
 vi.mock('./platform.js', () => ({
   centralUser: vi.fn(), centralSession: vi.fn(), getBrand: vi.fn(), portalFetch: vi.fn(),
 }));
+vi.mock('./mail.js', () => ({ processMailBatch: vi.fn() }));
+import { processMailBatch } from './mail.js';
 import * as db from './db.js';
 import * as storage from './documentStorage.js';
 import * as platform from './platform.js';
 import { createApp } from './app.js';
 import { cookieName, sessionToken } from './auth.js';
-import { HttpError } from './errors.js';
+import { HttpError, logger } from './errors.js';
 import { hashSecret } from './secrets.js';
 
 let server: Server;
@@ -64,6 +66,7 @@ beforeEach(() => {
   vi.resetAllMocks();
   fixtures.user.roles = ['Admissions Admin']; fixtures.user.isActive = true; fixtures.user.sessionVersion = 3;
   fixtures.config.emailEnabled = true;
+  fixtures.config.SQL_SERVERLESS_ENABLED = false;
   vi.mocked(platform.centralUser).mockImplementation(async () => ({ ...fixtures.user }));
   vi.mocked(platform.centralSession).mockImplementation(async () => ({ ...fixtures.user }));
   vi.mocked(db.getPages).mockResolvedValue([]);
@@ -71,6 +74,106 @@ beforeEach(() => {
   vi.mocked(db.authorizeDocuments).mockResolvedValue(4);
   vi.mocked(db.listDocuments).mockResolvedValue([]);
   vi.mocked(storage.storageReady).mockResolvedValue(true);
+});
+describe('serverless liveness, readiness and manual jobs', () => {
+  it('keeps liveness independent of SQL, storage and central services while initializing', async () => {
+    let ready = false;
+    const initializing = createApp(() => ready).listen(0, '127.0.0.1');
+    await once(initializing, 'listening');
+    const url = `http://127.0.0.1:${(initializing.address() as AddressInfo).port}`;
+    try {
+      expect((await fetch(`${url}/api/live`)).status).toBe(200);
+      for (const route of ['/api/health', '/api/config', '/api/branding', '/api/pages', '/api/auth/me']) {
+        const response = await fetch(`${url}${route}`);
+        expect(response.status).toBe(503);
+        expect(response.headers.get('Retry-After')).toBe('10');
+      }
+      const post = await fetch(`${url}/api/requests`, { method: 'POST' });
+      expect(post.status).toBe(503);
+      expect(db.getPages).not.toHaveBeenCalled();
+      expect(db.createRequest).not.toHaveBeenCalled();
+      expect(storage.storageReady).not.toHaveBeenCalled();
+      expect(platform.centralUser).not.toHaveBeenCalled();
+      expect(platform.getBrand).not.toHaveBeenCalled();
+      ready = true;
+      expect((await fetch(`${url}/api/pages`)).status).toBe(200);
+    } finally { await new Promise<void>((resolve) => initializing.close(() => resolve())); }
+  });
+  it('requires an authenticated central Full Admin and the existing CSRF origin check', async () => {
+    fixtures.config.SQL_SERVERLESS_ENABLED = true;
+    const route = '/api/admin/background-jobs/run';
+    expect((await call(route, 'POST', {})).status).toBe(401);
+    for (const role of ['Admissions Admin', 'Admissions Contributor', 'Parent']) {
+      fixtures.user.roles = [role];
+      expect((await call(route, 'POST', {}, true)).status).toBe(403);
+    }
+    fixtures.user.roles = ['Full Admin'];
+    expect((await call(route, 'POST', {}, true, 'https://evil.example.test')).status).toBe(403);
+    expect(processMailBatch).not.toHaveBeenCalled();
+    vi.mocked(processMailBatch).mockResolvedValue({ sent: 2, failed: 0 });
+    const info = vi.spyOn(logger, 'info');
+    const response = await call(route, 'POST', {}, true);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ sent: 2, failed: 0 });
+    expect(info).toHaveBeenCalledWith({ actorId: 7, job: 'mail' }, 'Manual background processing started');
+    expect(info).toHaveBeenCalledWith({ actorId: 7, job: 'mail', sent: 2, failed: 0 }, 'Manual background processing finished');
+    expect(JSON.stringify(info.mock.calls)).not.toContain(fixtures.user.email);
+    info.mockRestore();
+  });
+  it('does not expose manual processing in normal mode or silently succeed after delivery errors', async () => {
+    fixtures.user.roles = ['Full Admin'];
+    const route = '/api/admin/background-jobs/run';
+    expect((await call(route, 'POST', {}, true)).status).toBe(404);
+    expect(processMailBatch).not.toHaveBeenCalled();
+    fixtures.config.SQL_SERVERLESS_ENABLED = true;
+    vi.mocked(processMailBatch).mockResolvedValue({ sent: 1, failed: 1 });
+    expect((await call(route, 'POST', {}, true)).status).toBe(502);
+    vi.mocked(processMailBatch).mockRejectedValue(Object.assign(new Error('SQL resuming'), { number: 40613 }));
+    const warn = vi.spyOn(logger, 'warn');
+    const response = await call(route, 'POST', {}, true);
+    expect(warn).toHaveBeenCalledWith({ actorId: 7, job: 'mail', errorType: 'Error' }, 'Manual background processing did not complete');
+    warn.mockRestore();
+    expect(response.status).toBe(503);
+    expect(response.headers.get('Retry-After')).toBe('10');
+  });
+  it('returns explicit SQL resume 503 without replaying writes or clearing a valid session', async () => {
+    fixtures.config.SQL_SERVERLESS_ENABLED = true;
+    const resume = Object.assign(new Error('SQL paused'), { code: 'ELOGIN', originalError: { info: { number: 40613 } } });
+    vi.mocked(db.updateRequest).mockRejectedValue(resume);
+    const response = await call('/api/staff/requests/4', 'PATCH', { revision: 1, stage: 'New' }, true);
+    expect(response.status).toBe(503);
+    expect(response.headers.get('Retry-After')).toBe('10');
+    expect(response.headers.get('Set-Cookie')).toBeNull();
+    expect(db.updateRequest).toHaveBeenCalledOnce();
+    vi.mocked(platform.centralUser).mockRejectedValue(new HttpError(503, 'Central SQL resuming.', 'PLATFORM_UNAVAILABLE'));
+    const staff = await call('/api/auth/me', 'GET', undefined, true);
+    expect(staff.status).toBe(503);
+    expect(staff.headers.get('Retry-After')).toBe('10');
+    expect(staff.headers.get('Set-Cookie')).toBeNull();
+    vi.mocked(platform.centralUser).mockResolvedValue(fixtures.user);
+    expect((await call('/api/auth/me', 'GET', undefined, true)).status).toBe(200);
+  });
+  it('does not reinterpret unknown SQL failures as wake errors', async () => {
+    fixtures.config.SQL_SERVERLESS_ENABLED = true;
+    vi.mocked(db.getPages).mockRejectedValue(Object.assign(new Error('bad schema'), { number: 208 }));
+    expect((await call('/api/pages')).status).toBe(500);
+  });
+  it('rate limits manual processing before it can run another batch', async () => {
+    fixtures.config.SQL_SERVERLESS_ENABLED = true;
+    fixtures.user.roles = ['Full Admin'];
+    vi.mocked(processMailBatch).mockResolvedValue({ sent: 0, failed: 0 });
+    const limited = createApp().listen(0, '127.0.0.1');
+    await once(limited, 'listening');
+    const url = `http://127.0.0.1:${(limited.address() as AddressInfo).port}/api/admin/background-jobs/run`;
+    const request = () => fetch(url, {
+      method: 'POST', headers: { Cookie: cookie, Origin: fixtures.config.PUBLIC_BASE_URL, 'Content-Type': 'application/json' }, body: '{}',
+    });
+    try {
+      for (let i = 0; i < 6; i++) expect((await request()).status).toBe(200);
+      expect((await request()).status).toBe(429);
+      expect(processMailBatch).toHaveBeenCalledTimes(6);
+    } finally { await new Promise<void>((resolve) => limited.close(() => resolve())); }
+  });
 });
 describe('private enquiry documents', () => {
   const code = 'd'.repeat(32), documentId = '11111111-1111-4111-8111-111111111111';

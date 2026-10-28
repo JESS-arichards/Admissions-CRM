@@ -22,6 +22,7 @@ const env = z.object({
   SQLAZURECONNSTR_DefaultConnection: optional,
   SQL_SERVER: optional,
   SQL_DATABASE: optional,
+  SQL_SERVERLESS_ENABLED: bool(false),
   SQL_AUTH: z.enum(['sql', 'managed-identity']).default('managed-identity'),
   SQL_USER: optional,
   SQL_PASSWORD: optional,

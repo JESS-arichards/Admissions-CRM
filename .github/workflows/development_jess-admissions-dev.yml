@@ -74,6 +74,32 @@ jobs:
           tenant-id: ${{ secrets.AZUREAPPSERVICE_TENANTID_37920CDA620E49D5A242A07097CDF52F }}
           subscription-id: ${{ secrets.AZUREAPPSERVICE_SUBSCRIPTIONID_287F7E66FDFB4243BD22FD3A88C4C8CE }}
 
+      - name: Enable development SQL serverless mode and liveness health check
+        shell: bash
+        run: |
+          set -euo pipefail
+          app_name='jess-admissions-dev'
+          if ! groups=$(az webapp list --query "[?name=='${app_name}'].resourceGroup" -o tsv --only-show-errors 2>/dev/null); then
+            echo "::error::Could not list App Services. Check the deployment identity's read permissions."
+            exit 1
+          fi
+          count=$(printf '%s\n' "$groups" | sed '/^$/d' | wc -l)
+          if [ "$count" -ne 1 ]; then
+            echo "::error::Expected exactly one ${app_name} App Service; found ${count}."
+            exit 1
+          fi
+          if ! az webapp config appsettings set --name "$app_name" --resource-group "$groups" \
+            --settings SQL_SERVERLESS_ENABLED=true --only-show-errors --output none >/dev/null 2>&1; then
+            echo "::error::Could not set SQL_SERVERLESS_ENABLED on ${app_name}. Check the deployment identity's App Service write permissions."
+            exit 1
+          fi
+          if ! az webapp config set --name "$app_name" --resource-group "$groups" \
+            --generic-configurations '{"healthCheckPath":"/api/live"}' --only-show-errors --output none >/dev/null 2>&1; then
+            echo "::error::Could not set the ${app_name} Health check path. Check the deployment identity's App Service write permissions."
+            exit 1
+          fi
+          echo "Enabled development SQL serverless mode and the /api/live Health check on ${app_name}."
+
       - name: Configure approved development runtime settings
         if: github.event_name == 'workflow_dispatch' && inputs.configure_runtime
         shell: bash
@@ -171,4 +197,5 @@ jobs:
             echo "::error::Could not resolve the development web app hostname."
             exit 1
           fi
+          curl --fail --silent --show-error --retry 12 --retry-all-errors --retry-delay 10 --max-time 20 "https://$host/api/live"
           curl --fail --silent --show-error --retry 12 --retry-all-errors --retry-delay 10 --max-time 20 "https://$host/api/health"

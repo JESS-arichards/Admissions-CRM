@@ -15,7 +15,14 @@ const connection: sql.config | string = config.SQL_CONNECTION_STRING || config.S
     ? { user: config.SQL_USER, password: config.SQL_PASSWORD }
     : { authentication: { type: 'azure-active-directory-default', options: { clientId: config.SQL_MANAGED_IDENTITY_CLIENT_ID } } }),
 };
-export const pool = new sql.ConnectionPool(connection);
+// mssql exposes the parsed configuration, but @types/mssql omits this property.
+export const pool = new sql.ConnectionPool(connection) as sql.ConnectionPool & { config: sql.config };
+if (config.SQL_SERVERLESS_ENABLED) {
+  // Apply after mssql parses connection strings so their pool settings cannot keep SQL awake.
+  pool.config.pool = { ...pool.config.pool, min: 0, idleTimeoutMillis: 30000 };
+  pool.config.connectionTimeout = 10000;
+  pool.config.options = { ...pool.config.options, connectTimeout: 10000 };
+}
 pool.on('error', (err) => logger.error({ err }, 'Admissions SQL pool error'));
 
 async function transaction<T>(action: (tx: sql.Transaction) => Promise<T>): Promise<T> {

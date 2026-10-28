@@ -35,29 +35,46 @@ async function send(job: db.MailJob) {
   });
   if (!response.ok) throw new HttpError(response.status, 'Microsoft Graph rejected email delivery.', 'GRAPH_SEND_FAILED');
 }
-export function startMailWorker() {
-  let stopping = false;
-  let running: Promise<void> | null = null;
+let running: Promise<{ sent: number; failed: number }> | null = null;
+export function processMailBatch(shouldStop: () => boolean = () => false) {
+  if (running) throw new HttpError(409, 'Background processing is already running.', 'BACKGROUND_BUSY');
+  if (!config.emailEnabled) throw new HttpError(503, 'Email delivery is not configured.', 'MAIL_NOT_CONFIGURED');
   const tick = async () => {
-    try {
-      for (let i = 0; i < 10 && !stopping; i++) {
-        const job = await db.claimMail();
-        if (!job) break;
-        try {
-          await send(job);
-          await db.completeMail(job);
-        } catch (error) {
-          logger.error({
-            jobId: job.id, attempt: job.attempts, errorType: error instanceof Error ? error.name : 'Unknown',
-            ...(error instanceof HttpError ? { code: error.code, httpStatus: error.status } : {}),
-          }, 'Admissions email delivery failed; retry queued or exhausted');
-          await db.failMail(job);
-        }
+    const result = { sent: 0, failed: 0 };
+    for (let i = 0; i < 10 && !shouldStop(); i++) {
+      const job = await db.claimMail();
+      if (!job) break;
+      try {
+        await send(job);
+      } catch (error) {
+        logger.error({
+          jobId: job.id, attempt: job.attempts, errorType: error instanceof Error ? error.name : 'Unknown',
+          ...(error instanceof HttpError ? { code: error.code, httpStatus: error.status } : {}),
+        }, 'Admissions email delivery failed; retry queued or exhausted');
+        await db.failMail(job);
+        result.failed++;
+        continue;
       }
-    } catch (error) { logger.error({ err: error }, 'Admissions email worker failed'); }
+      // A lost completion acknowledgement must not immediately requeue a delivered message.
+      await db.completeMail(job);
+      result.sent++;
+    }
+    return result;
   };
+  running = tick().finally(() => { running = null; });
+  return running;
+}
+
+export function startMailWorker() {
+  if (config.SQL_SERVERLESS_ENABLED) return async () => {};
+  let stopping = false;
+  let pending: Promise<unknown> | null = null;
   const timer = setInterval(() => {
-    if (!running && config.emailEnabled) running = tick().finally(() => { running = null; });
+    if (!running && config.emailEnabled) {
+      pending = processMailBatch(() => stopping)
+        .catch((error: unknown) => { logger.error({ err: error }, 'Admissions email worker failed'); })
+        .finally(() => { pending = null; });
+    }
   }, 5000);
-  return async () => { stopping = true; clearInterval(timer); await running; };
+  return async () => { stopping = true; clearInterval(timer); await pending; };
 }
