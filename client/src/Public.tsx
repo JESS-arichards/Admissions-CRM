@@ -3,11 +3,12 @@ import { Link, useParams, useSearchParams } from 'react-router';
 import { ArrowRight, CalendarDays, CheckCircle2, MessageCircle, Search } from 'lucide-react';
 import type { Brand, Page, Progress } from '../../shared/contracts';
 import { KINDS } from '../../shared/contracts';
+import { formatDateTime } from '../../shared/dateFormatting';
 import { Alert } from './App';
 import { api, errorMessage } from './api';
 import { Documents } from './Documents';
 
-const date = (value: string) => new Date(value).toLocaleString();
+const date = (value: string) => formatDateTime(value);
 export function Information({ pages, brand, home = false }: { pages: Page[]; brand: Brand; home?: boolean }) {
   const { slug } = useParams();
   const page = pages.find((item) => item.slug === (home ? 'welcome' : slug));

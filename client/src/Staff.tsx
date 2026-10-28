@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState, type FormEvent } from 'react';
 import { Link, useParams } from 'react-router';
 import { canAdminister, STAGES, type CentralUser, type Page, type RequestDetail, type RequestSummary } from '../../shared/contracts';
+import { formatDate, formatDateTime } from '../../shared/dateFormatting';
 import { api, errorMessage } from './api';
 import { Alert } from './App';
 import { Documents } from './Documents';
@@ -43,7 +44,7 @@ export function Pipeline({ user }: { user: CentralUser }) {
           {items.map((item) => <Link to={`/staff/requests/${item.id}`} key={item.id} className="request-card panel">
             <span className="eyebrow">#{item.id} / {item.kind}</span><h3>{item.parentName}</h3>
             <p>{item.email}</p>{item.yearGroup && <p>{item.yearGroup}</p>}
-            <div className="card-meta"><span>{item.ownerName || 'Unassigned'}</span><time>{new Date(item.createdAt).toLocaleDateString()}</time></div>
+            <div className="card-meta"><span>{item.ownerName || 'Unassigned'}</span><time>{formatDate(item.createdAt)}</time></div>
           </Link>)}
         </section>;
       })}</div>
@@ -90,7 +91,7 @@ export function RequestEditor({ user }: { user: CentralUser }) {
           <dt>Phone</dt><dd>{detail.phone || 'Not provided'}</dd>
           <dt>Year group / entry</dt><dd>{detail.yearGroup || 'Not provided'}</dd>
           <dt>Owner</dt><dd>{detail.ownerName || 'Unassigned'}{detail.ownerId === user.id ? ' (you)' : ''}</dd>
-          <dt>Received</dt><dd>{new Date(detail.createdAt).toLocaleString()}</dd>
+          <dt>Received</dt><dd>{formatDateTime(detail.createdAt)}</dd>
           <dt>Email updates</dt><dd>{detail.notifications}</dd>
         </dl><h3>Parent's message</h3><p className="plain-text">{detail.message}</p>
           <p className="muted">Email queue: {detail.emailQueue.pending} pending, {detail.emailQueue.failed} failed.</p>
@@ -111,7 +112,7 @@ export function RequestEditor({ user }: { user: CentralUser }) {
       </div>
       <Documents key={detail.id} requestId={detail.id} />
       <section className="panel"><h2>Activity history</h2><ol className="timeline">{detail.events.map((entry) => <li key={entry.id}>
-        <div className="section-heading"><strong>{entry.actorName}</strong><time dateTime={entry.createdAt}>{new Date(entry.createdAt).toLocaleString()}</time></div>
+        <div className="section-heading"><strong>{entry.actorName}</strong><time dateTime={entry.createdAt}>{formatDateTime(entry.createdAt)}</time></div>
         <span className="badge">{entry.stage}</span>
         {entry.publicMessage && <div><h3>Parent-facing update</h3><p className="plain-text">{entry.publicMessage}</p></div>}
         {entry.internalNote && <div className="internal"><h3>Internal note</h3><p className="plain-text">{entry.internalNote}</p></div>}

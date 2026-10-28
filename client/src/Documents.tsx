@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState, type FormEvent } from 'react';
 import { DOCUMENT_MAX_BYTES, DOCUMENT_MAX_COUNT, DOCUMENT_TYPES, type EnquiryDocument } from '../../shared/contracts';
+import { formatDateTime } from '../../shared/dateFormatting';
 import { api, ApiError, errorMessage } from './api';
 import { Alert } from './App';
 
@@ -73,7 +74,7 @@ export function Documents({ code, requestId }: { code?: string; requestId?: numb
     {!result ? !error && <p role="status">Loading documents...</p> : <>
       {!result.ready && <p role="status">Private document storage is unavailable. Existing enquiries still work. Contact Admissions if you need to send a document.</p>}
       <ul>{result.documents.map((document) => <li key={document.id}>
-        {document.filename} — {(document.size / 1024).toFixed(0)} KB, uploaded by {document.uploadedBy}, {new Date(document.createdAt).toLocaleString()}{' '}
+        {document.filename} — {(document.size / 1024).toFixed(0)} KB, uploaded by {document.uploadedBy}, {formatDateTime(document.createdAt)}{' '}
         <button type="button" disabled={busy || !result.ready} onClick={() => void download(document)}>Download</button>
       </li>)}</ul>
       {!result.documents.length && <p>No documents yet.</p>}

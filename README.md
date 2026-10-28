@@ -77,6 +77,17 @@ node scripts\sync-navigation.mjs --check ..\Admissions-CRM
 Commit updated copies in this repository. Branding colour helpers and their tests
 were also reused from the Portal; keep their behaviour aligned when updating them.
 
+User-facing dates use the shared UK display policy: short dates are
+`DD/MM/YYYY`, long dates are `D Month YYYY`, and date-times retain their time.
+The canonical helper is `Applications-Portal/shared/dateFormatting.ts`; do not
+edit the synchronized `shared/dateFormatting.ts` here. After changing the policy,
+run `node scripts/sync-date-formatting.mjs` from the Applications-Portal root.
+Commit and deploy all repositories together so their shared copies stay aligned.
+This is a code policy, not a runtime administrator setting. API/database values,
+logs, date inputs, filenames and machine-oriented exports remain in their
+interoperable formats; human-facing export report dates should use the UK policy.
+Native `type="date"` controls remain browser-locale dependent.
+
 ## Local development
 
 1. Install Node.js 24 and provision an **empty, separate Admissions SQL database**.
