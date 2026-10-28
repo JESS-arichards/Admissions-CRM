@@ -1,5 +1,6 @@
 import { Children, createElement, isValidElement, type ReactNode } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
+import { readFileSync } from 'node:fs';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const state = vi.hoisted(() => ({ index: 0, menu: true, mobile: false, scrolled: false, collapsed: false, setters: [] as ReturnType<typeof vi.fn>[] }));
@@ -42,6 +43,17 @@ function find(root: ReactNode, predicate: (props: Record<string, unknown>) => bo
 beforeEach(() => { state.index = 0; state.menu = true; state.mobile = false; state.scrolled = false; state.collapsed = false; state.setters = []; });
 
 describe('shared navigation', () => {
+  it('lets mobile titles wrap without truncating them or shrinking the controls', () => {
+    const css = readFileSync(new URL('./navigation.css', import.meta.url), 'utf8');
+    const mobile = css.slice(css.indexOf('@media (max-width: 600px)'));
+    expect(mobile).toContain('white-space: normal');
+    expect(mobile).toContain('overflow: visible');
+    expect(mobile).toContain('overflow-wrap: anywhere');
+    expect(mobile).toContain('max-width: 80px');
+    expect(mobile).toContain('.jess-nav-actions { display: none; }');
+    expect(mobile).toContain('width: 40px; height: 44px');
+    expect(mobile).not.toContain('text-overflow: ellipsis');
+  });
   it('enables the navigation shield after scrolling or opening mobile navigation', () => {
     expect(NavigationBar(defaults).props.className).not.toContain('is-scrolled');
     state.index = 0;

@@ -1,5 +1,9 @@
 # Admissions CRM
 
+On screens up to 600px wide, the shared navigation title wraps rather than
+truncating. The logo is capped at 80px wide and information/menu controls retain
+their touch targets. Longer titles can increase the header height.
+
 A public-facing school admissions site and staff workspace, inspired by the
 pipeline-based CRM workflow popularised by HubSpot. This is an independent
 implementation, not a HubSpot integration or reproduction of its proprietary UI.
